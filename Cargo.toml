@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/radar-core",
+    "crates/radar-mcp",
+    "crates/radar-cli",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+radar-core = { path = "crates/radar-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.35", features = ["bundled"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+quick-xml = { version = "0.37", features = ["serialize"] }
+async-trait = "0.1"
+lancedb = "0.16"
+arrow-array = "53"
+arrow-schema = "53"
+futures = "0.3"
