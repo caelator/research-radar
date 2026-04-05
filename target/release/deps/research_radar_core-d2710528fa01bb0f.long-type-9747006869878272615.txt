@@ -1,0 +1,1 @@
+MappedRows<'_, for<'a, 'b> fn(&'a Row<'b>) -> std::result::Result<Entry, StorageError> {DbPool::row_to_entry}>

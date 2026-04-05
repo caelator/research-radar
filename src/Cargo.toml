@@ -1,0 +1,15 @@
+[package]
+name = "research-radar"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "research-radar"
+path = "main.rs"
+
+[dependencies]
+research-radar-core = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dirs = { workspace = true }
