@@ -6,14 +6,15 @@
 //! research-radar add <url>          # Add a source URL to the radar
 //! research-radar search <query>      # Search entries by keyword
 //! research-radar list                # List all sources
+//! research-radar mcp                 # Start the MCP JSON-RPC server
 //! ```
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use research_radar_core::{
-    DbPool, RadarQuery, RadarResult, Source, SourceType,
-};
+use research_radar_core::{DbPool, RadarQuery, RadarResult, Source, SourceType};
+
+mod mcp_server;
 
 #[derive(Parser)]
 #[command(
@@ -60,6 +61,9 @@ enum Commands {
 
     /// Show the database path being used.
     DbPath,
+
+    /// Start the MCP JSON-RPC server (stdio).
+    Mcp,
 }
 
 fn main() {
@@ -170,6 +174,13 @@ fn main() {
         Commands::DbPath => {
             let home = dirs::home_dir().unwrap_or_default();
             println!("{}/.research-radar/data.db", home.display());
+        }
+
+        Commands::Mcp => {
+            if let Err(e) = mcp_server::run_mcp_server(&pool) {
+                eprintln!("MCP server error: {e}");
+                std::process::exit(1);
+            }
         }
     }
 }

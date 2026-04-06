@@ -142,7 +142,137 @@ impl RadarResult {
     }
 }
 
+// ─── Profile ─────────────────────────────────────────────────────────
+
+/// A monitoring profile defining keywords, sources, and scoring preferences.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Profile {
+    pub id: String,
+    pub name: String,
+    pub keywords: Vec<String>,
+    pub negative_keywords: Vec<String>,
+    pub sources: Vec<String>,
+    pub scoring_prompt: Option<String>,
+    pub score_threshold: f64,
+    pub max_llm_calls: u32,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Profile {
+    pub fn new(name: String, keywords: Vec<String>) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            name,
+            keywords,
+            negative_keywords: Vec::new(),
+            sources: Vec::new(),
+            scoring_prompt: None,
+            score_threshold: 0.5,
+            max_llm_calls: 10,
+            created_at: Utc::now(),
+        }
+    }
+}
+
+// ─── ScanJob ─────────────────────────────────────────────────────────
+
+/// Status of a scan job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScanJobStatus {
+    Pending,
+    Running,
+    Complete,
+    Failed,
+}
+
+impl ScanJobStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "pending" => Self::Pending,
+            "running" => Self::Running,
+            "complete" => Self::Complete,
+            "failed" => Self::Failed,
+            _ => Self::Pending,
+        }
+    }
+}
+
+/// A scan job triggered by profile scan_now.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanJob {
+    pub id: String,
+    pub profile_id: String,
+    pub status: ScanJobStatus,
+    pub progress: u32,
+    pub total: u32,
+    pub reason: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+impl ScanJob {
+    pub fn new(profile_id: String, reason: Option<String>) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            profile_id,
+            status: ScanJobStatus::Pending,
+            progress: 0,
+            total: 0,
+            reason,
+            created_at: Utc::now(),
+            completed_at: None,
+        }
+    }
+}
+
+// ─── Subscription ─────────────────────────────────────────────────────
+
+/// A notification subscription for a profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Subscription {
+    pub id: String,
+    pub profile_id: String,
+    pub channel: String,
+    pub config: serde_json::Value,
+    pub enabled: bool,
+}
+
+impl Subscription {
+    pub fn new(profile_id: String, channel: String, config: serde_json::Value, enabled: bool) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            profile_id,
+            channel,
+            config,
+            enabled,
+        }
+    }
+}
+
+// ─── ScoredMatch ─────────────────────────────────────────────────────
+
+/// An entry scored against a profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoredMatch {
+    pub entry: Entry,
+    pub profile_id: String,
+    pub score: f64,
+    pub disposition: String,
+}
+
 // ─── Re-exports ──────────────────────────────────────────────────────
 
+pub mod score;
 pub mod storage;
-pub use storage::{DbPool, StorageError};
+pub use score::score_entry;
+pub use storage::{DbPool, SourceHealth, StorageError};
