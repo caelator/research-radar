@@ -1,0 +1,77 @@
+{
+  "round": 1,
+  "decisions": [
+    {
+      "issue": "Define schema evolution/versioning in V1 rather than leaving it as an open question",
+      "severity": "low",
+      "disposition": "ACCEPT",
+      "rationale": "compile-time coupling makes compatibility policy load-bearing, so the ADD must specify versioning, migration entrypoints, and plugin compatibility rules.",
+      "source_model": "claude"
+    },
+    {
+      "issue": "Specify the boundary between shared state and filesystem audit logs",
+      "severity": "low",
+      "disposition": "ACCEPT",
+      "rationale": "the hybrid architecture only works if the ADD gives a deterministic classification rule and applies it in the migration matrix.",
+      "source_model": "claude"
+    },
+    {
+      "issue": "Define `projections` explicitly in the canonical schema",
+      "severity": "low",
+      "disposition": "ACCEPT",
+      "rationale": "keeping it undefined would make the migration matrix and table ownership rules incomplete.",
+      "source_model": "claude"
+    },
+    {
+      "issue": "Specify the URN format and uniqueness scope",
+      "severity": "low",
+      "disposition": "ACCEPT",
+      "rationale": "URNs are the cross-table identity backbone, so leaving them implicit invites collisions and inconsistent parsing.",
+      "source_model": "claude"
+    },
+    {
+      "issue": "Call out `research-radar` migration as greenfield for embeddings and make model selection a prerequisite",
+      "severity": "low",
+      "disposition": "ACCEPT",
+      "rationale": "that clarification prevents stakeholders from underestimating migration work.",
+      "source_model": "claude"
+    },
+    {
+      "issue": "Define `QueryPlanner` narrowly instead of leaving it ambiguous",
+      "severity": "low",
+      "disposition": "ACCEPT",
+      "rationale": "it should exist only for hybrid structured+semantic queries and cross-collection resolution, not as a duplicate of store APIs.",
+      "source_model": "claude"
+    },
+    {
+      "issue": "Mandate write mediation for LanceDB concurrency",
+      "severity": "medium",
+      "disposition": "PARTIAL",
+      "rationale": "the ADD should require a single write-coordination mechanism in `layers-data`, but V1 only needs the design contract and validation criteria, not a daemon implementation.",
+      "source_model": "gemini"
+    },
+    {
+      "issue": "Prevent vector drift between entities and the dedicated embeddings table",
+      "severity": "low",
+      "disposition": "ACCEPT",
+      "rationale": "the API must make entity/embedding lifecycle synchronization an invariant via coordinated upserts and tombstoning.",
+      "source_model": "gemini"
+    },
+    {
+      "issue": "Define cross-boundary integrity for LanceDB entities referenced by file logs",
+      "severity": "low",
+      "disposition": "ACCEPT",
+      "rationale": "soft deletes/tombstones are needed so append-only logs never point at vanished URNs.",
+      "source_model": "gemini"
+    },
+    {
+      "issue": "Choose one workspace isolation model instead of leaving both open",
+      "severity": "low",
+      "disposition": "ACCEPT",
+      "rationale": "the architecture should commit to a single canonical store model so V2 APIs have a stable target.",
+      "source_model": "gemini"
+    }
+  ],
+  "material_change": true,
+  "schema_version": 1
+}

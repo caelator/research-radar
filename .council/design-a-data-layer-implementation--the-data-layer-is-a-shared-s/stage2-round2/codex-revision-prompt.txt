@@ -1,0 +1,260 @@
+You are the deliberation lead (synthesis-owner) in an AI planning council.
+
+Your job:
+- Review EVERY critique point from adversarial reviewers — do not skip any
+- Classify each as ACCEPT / PARTIAL / REJECT with a one-sentence rationale
+- Produce a revised plan incorporating accepted/partial changes
+- Keep decisions concise to avoid truncation
+- Preserve strengths called out by reviewers unless a change requires otherwise
+
+Telemetry-guided working method:
+- Triage critiques in this order: LOW first, then MEDIUM, then HIGH. This prevents
+  defensive overreaction and usually surfaces easy wins early.
+- For every ACCEPT or PARTIAL, identify the exact plan section to modify and the
+  concrete delta you will apply before writing the revised plan.
+- For PARTIAL, accept the valid core of the critique and explicitly scope the fix
+  to the smallest change that resolves the real issue.
+
+Severity-proportional disposition (IMPORTANT — follow strictly):
+- **Low-severity critiques → almost always ACCEPT.** These are minor improvements
+  by definition. Accept them unless the suggested change is actively harmful.
+  Rejecting a low-severity critique requires strong justification.
+- **Medium-severity critiques → lean ACCEPT or PARTIAL.** Default to ACCEPT when
+  the critique identifies a real gap. Use PARTIAL when directionally correct but
+  the suggested fix is too broad — accept the spirit, scope down the change.
+- **High-severity critiques → evaluate carefully.** These claim the plan would fail.
+  If the claim is valid, ACCEPT. If overstated, PARTIAL with a scoped fix.
+  REJECT only if the issue genuinely doesn't exist.
+- REJECT is reserved for critiques that misunderstand the plan, identify a
+  non-existent problem, or propose a fix that makes the design worse.
+  Every REJECT must include a specific explanation — not just a dismissal.
+
+Zero-acceptance safeguard:
+- If you are about to REJECT every critique, STOP. Re-read each one and find at
+  least one genuine improvement to ACCEPT. A 100% rejection rate almost always
+  means you are being too defensive, not that every critique is wrong.
+- If you find yourself rejecting more than a third of critiques, pause and
+  reconsider whether you are defending the plan rather than improving it.
+
+Current plan:
+## Decision Log
+### Claude (conceptual-risk)
+- ACCEPT: Define schema evolution/versioning in V1 rather than leaving it as an open question -- compile-time coupling makes compatibility policy load-bearing, so the ADD must specify versioning, migration entrypoints, and plugin compatibility rules.
+- ACCEPT: Specify the boundary between shared state and filesystem audit logs -- the hybrid architecture only works if the ADD gives a deterministic classification rule and applies it in the migration matrix.
+- ACCEPT: Define `projections` explicitly in the canonical schema -- keeping it undefined would make the migration matrix and table ownership rules incomplete.
+- ACCEPT: Specify the URN format and uniqueness scope -- URNs are the cross-table identity backbone, so leaving them implicit invites collisions and inconsistent parsing.
+- ACCEPT: Call out `research-radar` migration as greenfield for embeddings and make model selection a prerequisite -- that clarification prevents stakeholders from underestimating migration work.
+- ACCEPT: Define `QueryPlanner` narrowly instead of leaving it ambiguous -- it should exist only for hybrid structured+semantic queries and cross-collection resolution, not as a duplicate of store APIs.
+
+### Gemini (implementation-risk)
+- PARTIAL: Mandate write mediation for LanceDB concurrency -- the ADD should require a single write-coordination mechanism in `layers-data`, but V1 only needs the design contract and validation criteria, not a daemon implementation.
+- ACCEPT: Prevent vector drift between entities and the dedicated embeddings table -- the API must make entity/embedding lifecycle synchronization an invariant via coordinated upserts and tombstoning.
+- ACCEPT: Define cross-boundary integrity for LanceDB entities referenced by file logs -- soft deletes/tombstones are needed so append-only logs never point at vanished URNs.
+- ACCEPT: Choose one workspace isolation model instead of leaving both open -- the architecture should commit to a single canonical store model so V2 APIs have a stable target.
+
+## Revised Plan
+## 1. Goal and constraints
+- **Goal**: Design a unified, shared data layer embedded within the `layers` codebase to serve as the single source of truth for all Caelator ecosystem plugins (`council`, `openclaw-pm`, `research-radar`, `evolve`).
+- **Constraint**: Must strictly use LanceDB as the underlying vector and structured data store for shared, queryable state. No alternative databases may be considered for this purpose.
+- **Constraint**: The data layer must support both semantic (vector) search and structured (relational/metadata) queries natively.
+- **Constraint**: Plugins must cease maintaining isolated persistent storage silos for shared state; the design must prevent data duplication across the ecosystem.
+- **Constraint**: This phase is strictly for architectural design and documentation; no Rust implementation or plugin refactoring is to be executed yet.
+
+## 2. Candidate approaches
+### Approach A: Single Monolithic Collection (The "Everything Bagel")
+- **Concept**: A single LanceDB collection (`caelator_memory`) stores every entity across all plugins with generic metadata plus a flexible payload blob.
+- **Tradeoffs**:
+  - *Pros*: Trivial cross-plugin semantic search. Minimal collection management overhead.
+  - *Cons*: Sparse schema, weak typing, heavy serialization logic.
+
+### Approach B: Domain-Specific Collections with a Unified Relational Graph
+- **Concept**: Fixed, strongly-typed domain collections share a mandatory `MemoryHeader` (`urn`, `parent_urn`, `workspace_id`, `tags`, `origin_plugin`), with embeddings stored inline.
+- **Tradeoffs**:
+  - *Pros*: Strong Rust typing. Cleaner per-domain schema evolution.
+  - *Cons*: Multi-collection semantic aggregation required. Inline vectors complicate re-embedding.
+
+### Approach C: Hybrid (LanceDB for Shared State/Vectors + File-based Append Logs)
+- **Concept**: Use strongly-typed LanceDB collections (`entities`, `relations`, `artifacts`, `embeddings`, `projections`) plus filesystem append logs for pure audit streams.
+- **Tradeoffs**:
+  - *Pros*: Keeps shared queryable state centralized while avoiding misuse of LanceDB for temporal traces; dedicated embeddings table preserves domain typing and simplifies re-indexing.
+  - *Cons*: Requires an explicit classification rule and cross-boundary lifecycle policy.
+
+## 3. Recommended approach with rationale [CHANGED]
+**Recommended: Approach C (Hybrid with Dedicated Embedding Index and File-based Logs)**
+- **Rationale**: Keep all shared, queryable, cross-plugin state in LanceDB; keep data filesystem-local **only if** it is append-only, never queried cross-plugin, and not semantically searchable.
+- **Dedicated Embeddings Table**: Semantic retrieval flows through `embeddings(subject_urn, space_id, chunk_id, vector, content_hash, status)` so model migration and multi-domain search do not churn domain schemas.
+- **Greenfield Vector Spaces**: `research-radar` is migrating from SQLite keyword search, not from an existing embedding store; embedding model/space selection is therefore a V1 prerequisite, not a migration afterthought.
+- **Unified Memory Language**: Every canonical row carries a standard `MemoryHeader`, and file logs may reference URNs but never replace canonical state.
+
+## 4. V1 scope [CHANGED]
+- **Deliverable**: A comprehensive markdown Architecture Design Document (ADD).
+- **Schema Definition**: Define canonical tables and ownership rules:
+  - `entities`: canonical stateful nodes keyed by `urn`.
+  - `relations`: typed edges between URNs.
+  - `artifacts`: larger content blobs or external-file descriptors attached to URNs.
+  - `embeddings`: semantic index rows keyed by `(subject_urn, space_id, chunk_id)`.
+  - `projections`: derived, rebuildable read models/materializations keyed by `(projection_name, subject_urn, version)`; never the system of record.
+- **Identity Spec**: The ADD must define URNs as `urn:caelator:{plugin_or_domain}:{kind}:{id}` with global uniqueness, allowed character rules, and the rule that URNs are opaque for logic but parseable for diagnostics.
+- **Schema Evolution**: Promote this into V1: additive columns are the default, each collection has a monotonic schema version, `layers_data::migrate()` upgrades stores in place, and plugins declare a supported schema-version range rather than assuming HEAD.
+- **API Surface Design**: Define a typed Rust crate (`layers-data`) exposing `EntityStore`, `RelationStore`, `ArtifactStore`, `SemanticIndex`, `EventLog`, and `QueryPlanner`.
+  - `QueryPlanner` is only for cross-collection resolution and hybrid structured+semantic queries; simple CRUD/filtering stays in the store traits.
+  - Entity/artifact writes must synchronize embedding upserts/tombstones through the same API boundary.
+  - Write concurrency is mediated by one mandated mechanism inside `layers-data` (initial design target: a cross-process write coordinator/lock wrapper so only one writer commits at a time).
+- **Migration Strategy**: Include a concrete ETL matrix for every persisted artifact in every plugin, and classify each as `LanceDB canonical` or `filesystem audit` using the rule above.
+
+## 5. V2 / later
+- **Implementation**: Writing the actual Rust code in the `layers` codebase to instantiate the LanceDB connection and expose the APIs.
+- **Plugin Refactoring**: Updating `research-radar`, `council`, and `openclaw-pm` source code to consume the new `layers` API and deleting their isolated local storage mechanisms.
+- **Advanced Graph Queries**: Implementing multi-hop relational queries across LanceDB collections within the `layers` API layer.
+- **Data Sync**: Mechanisms for synchronizing local LanceDB storage across different developer machines or to a cloud backup.
+
+## 6. Out of scope / do not build
+- Evaluation, benchmarking, or consideration of any database other than LanceDB (e.g., SQLite, Qdrant, Chroma).
+- Writing any Rust implementation code for the data layer or modifying existing plugin codebases during this design phase.
+- Design of network-level synchronization protocols or multi-user concurrent access models (assume single-user local dev environment for now).
+- Designing generic data ingestors for non-Caelator external tools.
+
+## 7. Files, binaries, and storage [CHANGED]
+- `docs/architecture/001-unified-data-layer.md`: The canonical output of this phase, detailing schema, API, migration, versioning, and audit-log classification.
+- **Canonical Store Decision**: Use one user-global LanceDB store at `~/.caelator/store/*.lance` with mandatory `workspace_id` on every canonical row; workspace-relative storage is reserved for append-only local audit logs only.
+- `crates/layers-data/src/`: The directory within the `layers` codebase where schema definitions, capability traits, and LanceDB implementations will live in V2.
+
+## 8. Control flow [CHANGED]
+1. **Initialization**: Plugins call `layers_data::open(global_store_path, plugin_context)` and receive typed capability handles.
+2. **Schema + Compatibility Check**: `layers-data` verifies collection schema versions, runs `layers_data::migrate()` if needed, and rejects unsupported plugin/schema version combinations.
+3. **Identity & Namespace**: Every write includes `PluginContext { plugin_id, workspace_id, capabilities }` and a generated canonical URN.
+4. **Write Path**: A plugin writes through `EntityStore`/`ArtifactStore`; `layers-data` acquires the write coordinator, persists canonical rows, and synchronizes embedding rows or tombstones in the same mediated operation.
+5. **Read Path**: `QueryPlanner` composes structured filters plus `SemanticIndex` hits, resolves `subject_urn` back to canonical records, and returns normalized `MemoryNode` results.
+6. **Audit Path**: Pure append-only traces are written to workspace-local logs and may reference URNs, but canonical records they reference are tombstoned rather than hard-deleted.
+
+## 9. Risks and open questions [CHANGED]
+- **LanceDB Rust API Maturity**: Validate that required filtering, joins, and projection rebuild workflows are supportable without excessive raw-engine escape hatches.
+- **Write Coordination Feasibility**: Confirm the chosen single-writer mediation pattern is sufficient for expected plugin concurrency and does not make common workflows unusably serial.
+- **Schema Evolution Operations**: The versioning policy is defined in V1, but migration ergonomics and rollback strategy still need validation.
+- **Embedding Space Governance**: Approved `space_id` values, model provenance fields, and re-embedding triggers must be finalized in the ADD.
+- **Projection Discipline**: Ensure projections remain rebuildable caches/read models and never accumulate canonical business state.
+
+## 10. Validation plan [CHANGED]
+- **Schema Desk-Check**: Map existing plugin data structures to the canonical schema, including explicit `projections` usage or confirmation that no projection is needed.
+- **Migration Mapping Matrix**: For every persisted artifact in `research-radar`, `openclaw-pm`, `council`, and `evolve`, record source store, target canonical rows or audit-log classification, deprecated path, and one worked end-to-end example per plugin.
+- **Compatibility Walkthrough**: Include pseudocode for schema-version negotiation, `layers_data::migrate()`, and one non-breaking additive schema change.
+- **Integrity Walkthrough**: Include pseudocode for coordinated entity+embedding upsert/delete, tombstoning policy for URNs referenced by file logs, and orphan-vector prevention checks.
+- **Concurrency Walkthrough**: Describe the write-mediation contract, conflict model, and a representative multi-plugin write scenario to validate that the design is implementable.
+
+
+Critiques:
+## Claude (conceptual-risk)
+{
+  "reviewer_role": "adversarial-reviewer/conceptual-risk",
+  "critiques": [
+    {
+      "issue": "Tombstone-based soft-delete creates an unbounded growth problem with no defined compaction or reaping policy",
+      "severity": "medium",
+      "why_it_matters": "Section 8 step 6 says canonical records are tombstoned rather than hard-deleted so append-only logs never reference vanished URNs. But the plan never defines when tombstones can be reaped. Over months of use the canonical tables accumulate dead rows that degrade query performance and inflate storage, yet removing them risks breaking the very log-referential-integrity guarantee tombstones exist to provide. Without a compaction policy (e.g., tombstones older than X days with no live log references may be purged), V2 implementers will either never compact — causing performance decay — or compact ad-hoc and silently break audit log integrity.",
+      "suggested_delta": "Add a tombstone lifecycle rule to Section 4 Schema Evolution: define a minimum retention period, a reference-check precondition for reaping (no live audit log references younger than the retention window), and require `layers_data::migrate()` to include a compaction pass.",
+      "evidence": "Section 8 step 6: 'canonical records they reference are tombstoned rather than hard-deleted'"
+    },
+    {
+      "issue": "The `projections` table has a composite key but no invalidation or staleness contract",
+      "severity": "low",
+      "why_it_matters": "Projections are defined as 'derived, rebuildable read models' keyed by `(projection_name, subject_urn, version)` but the plan does not specify what triggers a rebuild, how consumers detect staleness, or whether reads from a stale projection silently return outdated data. Without this, plugin authors will either poll-rebuild wastefully or serve stale results without knowing it.",
+      "suggested_delta": "In Section 4 under the projections bullet, add: projections must carry a `built_from_version` field referencing the source entity's last-modified version; `SemanticIndex`/`QueryPlanner` must compare this against the live entity version and either reject or lazily rebuild stale projections.",
+      "evidence": "Section 4: 'projections: derived, rebuildable read models/materializations keyed by (projection_name, subject_urn, version); never the system of record'"
+    },
+    {
+      "issue": "The classification rule for LanceDB-canonical vs. filesystem-audit is stated as a principle but never given as a concrete decision procedure",
+      "severity": "low",
+      "why_it_matters": "Section 3 says data goes to filesystem 'only if it is append-only, never queried cross-plugin, and not semantically searchable,' but the migration matrix in Section 10 asks authors to classify every artifact using 'the rule above.' A three-predicate conjunction applied by different plugin authors will produce inconsistent classifications for borderline cases (e.g., council debate transcripts — append-only but potentially cross-plugin searchable). Without a tiebreaker or worked ambiguous example, the migration matrix will have classification disagreements.",
+      "suggested_delta": "Add a tiebreaker clause: 'If any predicate is uncertain, default to LanceDB canonical. The ADD must include at least one worked borderline example showing how the three predicates are evaluated.'",
+      "evidence": "Section 3: 'keep data filesystem-local only if it is append-only, never queried cross-plugin, and not semantically searchable'"
+    },
+    {
+      "issue": "Write coordinator is described as cross-process but the concurrency walkthrough only requires a 'representative multi-plugin write scenario'",
+      "severity": "low",
+      "why_it_matters": "A cross-process write coordinator (file locks, named semaphores, or a daemon) has fundamentally different failure modes than an in-process mutex — stale locks after crashes, platform-specific behavior, no poison detection. The validation plan's concurrency walkthrough should explicitly require a crash-recovery scenario, not just a happy-path multi-writer scenario, or V2 will ship a lock that deadlocks after an ungraceful exit.",
+      "suggested_delta": "In Section 10 Concurrency Walkthrough, add: 'Must include a crash-recovery scenario demonstrating that a writer crash does not permanently block subsequent writers.'",
+      "evidence": "Section 4: 'initial design target: a cross-process write coordinator/lock wrapper so only one writer commits at a time'; Section 10: 'a representative multi-plugin write scenario'"
+    }
+  ],
+  "things_to_keep": [
+    "The URN identity spec with explicit format, uniqueness scope, and the opaque-for-logic/parseable-for-diagnostics duality — this prevents the single most common integration bug in multi-plugin systems",
+    "Dedicated embeddings table decoupled from domain schemas — this is the right call for model migration without churning entity tables",
+    "The canonical-vs-audit classification rule as a first-class architectural boundary rather than an implementation detail",
+    "Schema versioning with plugin-declared supported ranges rather than assuming HEAD — this prevents the silent breakage that kills plugin ecosystems",
+    "Requiring the migration matrix to include one worked end-to-end example per plugin — this forces the ADD author to validate feasibility rather than hand-wave"
+  ],
+  "schema_version": 1
+}
+
+## Gemini (implementation-risk)
+{
+  "reviewer_role": "adversarial-reviewer/implementation-risk",
+  "critiques": [
+    {
+      "issue": "LanceDB enforces strict fixed dimensionality for vector columns, making a single unified `embeddings` collection impossible if multiple models are used.",
+      "severity": "high",
+      "why_it_matters": "LanceDB uses Arrow's `FixedSizeList` for vectors. Storing e.g. OpenAI (1536d) and local MiniLM (384d) embeddings in the same table will cause hard runtime panics. The architecture will fail to compile or insert data.",
+      "suggested_delta": "Change the schema design to mandate collection-per-space (e.g., `embeddings_{space_id}`) or mandate a single, globally enforced ecosystem-wide embedding model and dimensionality.",
+      "evidence": "embeddings: semantic index rows keyed by (subject_urn, space_id, chunk_id)"
+    },
+    {
+      "issue": "Cross-process write locks are highly vulnerable to process crashes, risking ecosystem-wide deadlocks.",
+      "severity": "medium",
+      "why_it_matters": "If a Caelator plugin process segfaults, OOMs, or is SIGKILLed while holding the embedded LanceDB write lock, the database becomes permanently locked. All other plugins will block indefinitely until manual user intervention.",
+      "suggested_delta": "Require the ADD to define a crash-safe write coordination mechanism (e.g., lock leases with timeouts, stale-lock detection and recovery, or delegating writes to a dedicated daemon).",
+      "evidence": "initial design target: a cross-process write coordinator/lock wrapper so only one writer commits at a time"
+    },
+    {
+      "issue": "Bulk re-embedding migrations will starve all other plugins due to the single-writer constraint.",
+      "severity": "medium",
+      "why_it_matters": "Re-embedding thousands of nodes during a model upgrade is a long-running operation. Holding a single-writer lock for the duration will paralyze the entire agent ecosystem, preventing any state updates or logging.",
+      "suggested_delta": "The ADD must specify a strategy for long-running writes: either chunked transactions that periodically yield the lock, or a shadow-collection build followed by an atomic pointer swap.",
+      "evidence": "single-writer mediation pattern [...] re-embedding triggers must be finalized in the ADD."
+    },
+    {
+      "issue": "Opaque URNs prevent efficient structured filtering by domain or entity kind.",
+      "severity": "low",
+      "why_it_matters": "Forcing the query planner to do string prefix matching (`LIKE 'urn:caelator:openclaw:%'`) on URNs is inefficient compared to exact-match filtering on dictionary-encoded columns.",
+      "suggested_delta": "Add explicit `domain` and `kind` columns to the `entities` table to allow fast, indexed structured filtering, keeping the URN string as just the unique primary key.",
+      "evidence": "URNs are opaque for logic but parseable for diagnostics."
+    }
+  ],
+  "things_to_keep": [
+    "The explicit definition of `projections` to prevent derived data from becoming the system of record.",
+    "The clear boundary rule for what goes in LanceDB (queryable state) vs the filesystem (append-only audit logs).",
+    "Tombstoning canonical records instead of hard-deleting them to preserve integrity with file-based logs."
+  ],
+  "schema_version": 1
+}
+
+Task:
+Design a data layer implementation. The data layer is a shared storage and semantic retrieval substrate for the Caelator agent ecosystem. Requirements: (1) LanceDB as the backing vector/structured store, already used by research-radar for embeddings; (2) a unified memory schema — a shared data "language" that all plugins (layers, council, openclaw-pm, research-radar, evolve) speak and query instead of maintaining their own isolated stores; (3) the data layer is built into the layers codebase as the canonical shared substrate; (4) plugins stop duplicating storage and instead query this common semantic + structured store. The question: what is the best architecture, schema design, API surface, and integration pattern to make this real? Focus on: schema design for the unified memory language, LanceDB table/collection design, how layers exposes the data layer to plugins, how plugin-to-layer binding works, and what the migration path looks like for existing plugins that currently have their own storage.
+
+Return EXACTLY two sections in this format:
+
+## Decision Log
+Group decisions by source reviewer using ### subheadings.
+Use this EXACT format (one line per decision):
+
+### Claude (conceptual-risk)
+- ACCEPT: <issue summary> -- <rationale>
+- PARTIAL: <issue summary> -- <rationale>
+- REJECT: <issue summary> -- <rationale>
+
+### Gemini (implementation-risk)
+- ACCEPT: <issue summary> -- <rationale>
+- PARTIAL: <issue summary> -- <rationale>
+- REJECT: <issue summary> -- <rationale>
+
+You MUST address every critique point listed above. Do not skip any.
+Keep rationales to one sentence each.
+
+## Revised Plan
+The updated plan with accepted changes incorporated. Mark changed sections
+with [CHANGED] tags. Preserve all original sections that were not changed.
+
+Keep the revised plan CONCISE — do not expand unchanged sections. Only rewrite
+sections that were actually modified by accepted/partial critiques. Target the
+same length as the input plan or shorter.
+For each [CHANGED] section, make the delta obvious and directly traceable to one
+or more ACCEPT/PARTIAL decisions above.

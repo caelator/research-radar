@@ -1,0 +1,63 @@
+{
+  "round": 2,
+  "decisions": [
+    {
+      "issue": "The `projections` table needs an explicit staleness contract",
+      "severity": "low",
+      "disposition": "ACCEPT",
+      "rationale": "this is a low-severity gap and adding source-version tracking plus stale-read behavior removes ambiguity cheaply.",
+      "source_model": "claude"
+    },
+    {
+      "issue": "The LanceDB-vs-filesystem rule needs a concrete default/tiebreaker procedure",
+      "severity": "low",
+      "disposition": "ACCEPT",
+      "rationale": "this is a low-severity consistency improvement and defaulting uncertain cases to LanceDB prevents classification drift.",
+      "source_model": "claude"
+    },
+    {
+      "issue": "The concurrency walkthrough must include crash recovery, not just happy-path multi-writer flow",
+      "severity": "low",
+      "disposition": "ACCEPT",
+      "rationale": "cross-process coordination has crash-specific failure modes, so the validation plan should test them explicitly.",
+      "source_model": "claude"
+    },
+    {
+      "issue": "Tombstones need a lifecycle and compaction policy",
+      "severity": "low",
+      "disposition": "ACCEPT",
+      "rationale": "the concern is valid and V1 should define retention, reap preconditions, and a bounded cleanup mechanism rather than leaving dead-row growth unmanaged.",
+      "source_model": "claude"
+    },
+    {
+      "issue": "Opaque URNs make domain/kind filtering inefficient",
+      "severity": "medium",
+      "disposition": "PARTIAL",
+      "rationale": "the URN should remain the canonical identity, but the schema should add explicit indexed `domain` and `kind` columns for structured filtering.",
+      "source_model": "gemini"
+    },
+    {
+      "issue": "Cross-process write coordination must be crash-safe, not just serialized",
+      "severity": "low",
+      "disposition": "ACCEPT",
+      "rationale": "the ADD needs a lease/stale-lock recovery contract because a naive lock wrapper is operationally unsafe.",
+      "source_model": "gemini"
+    },
+    {
+      "issue": "Long re-embedding jobs will starve the ecosystem under a single-writer model",
+      "severity": "low",
+      "disposition": "ACCEPT",
+      "rationale": "the ADD should require chunked/yielding rebuilds or shadow-build plus atomic cutover for bulk embedding migrations.",
+      "source_model": "gemini"
+    },
+    {
+      "issue": "A single unified `embeddings` collection fails if multiple vector dimensions/models are allowed",
+      "severity": "low",
+      "disposition": "ACCEPT",
+      "rationale": "the physical design must use one embedding collection per registered space/dimension or else mandate a single global model, and the former is the safer architecture.",
+      "source_model": "gemini"
+    }
+  ],
+  "material_change": true,
+  "schema_version": 1
+}

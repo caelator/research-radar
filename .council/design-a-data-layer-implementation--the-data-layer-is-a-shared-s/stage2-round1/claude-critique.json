@@ -1,0 +1,55 @@
+{
+  "reviewer_role": "adversarial-reviewer/conceptual-risk",
+  "critiques": [
+    {
+      "issue": "Schema evolution strategy is listed as an open question but left unresolved, despite being load-bearing for the entire multi-plugin compile-time coupling design.",
+      "severity": "high",
+      "why_it_matters": "Every plugin will take a compile-time dependency on `layers-data`. A breaking schema change (adding a required column, changing a URN format, altering the MemoryHeader) forces lockstep releases of all plugins simultaneously. Without a concrete versioning or migration strategy in the ADD itself, the first schema change post-V2 will either break plugins or force ad-hoc compatibility hacks that undermine the 'single source of truth' goal.",
+      "suggested_delta": "Section 9 should be promoted into the V1 deliverable: the ADD must define a schema versioning mechanism (e.g., monotonic schema version per collection, forward-compatible column addition policy, a `layers_data::migrate()` entrypoint) and state whether plugins pin to a schema version range or must always track HEAD.",
+      "evidence": "Section 9: 'How do we handle database migrations when the Unified Memory schema needs to change, given that multiple plugins depend on it simultaneously?' — listed as open question, not addressed in V1 scope or validation plan."
+    },
+    {
+      "issue": "The boundary between 'shared state' (LanceDB) and 'local audit log' (filesystem) — the defining characteristic of Approach C — is never actually specified.",
+      "severity": "medium",
+      "why_it_matters": "The Hybrid approach was chosen specifically because it separates shared queryable state from append-only logs. But the ADD deliverable (Section 4) only defines the LanceDB side. Without explicit criteria for what qualifies as an audit log vs. shared state, each plugin team will draw the line differently, recreating the silo problem the design aims to solve.",
+      "suggested_delta": "Add a concrete classification rule to the V1 ADD, e.g.: 'Data is filesystem-local if and only if it is (a) append-only, (b) never queried cross-plugin, and (c) not semantically searchable. All other persisted state must reside in LanceDB.' Then apply this rule to every existing persistence artifact in the migration matrix.",
+      "evidence": "Section 3: 'The Hybrid approach isolates shared, queryable state into LanceDB while leaving temporal streams as simple files.' Section 2C cons: 'Requires defining clear boundaries between what is shared state and what is local audit log.'"
+    },
+    {
+      "issue": "The `projections` canonical table is named four times but never defined — its schema, purpose, producers, and consumers are absent.",
+      "severity": "medium",
+      "why_it_matters": "The migration matrix and API walkthrough validation steps cannot be completed if a core table lacks a definition. Plugin authors reading the ADD will not know whether their derived/computed data belongs in `projections` or `entities`, leading to inconsistent usage from day one.",
+      "suggested_delta": "In Section 4's schema definition, add a definition block for `projections` with the same specificity as the other tables (primary key, required columns, ownership rules), or explicitly defer it to V2 and remove it from the canonical table list to avoid confusion.",
+      "evidence": "Section 4: '…a stable, canonical set of tables: entities, relations, artifacts, embeddings, and projections.' No further mention of projections' schema or role."
+    },
+    {
+      "issue": "The URN scheme is referenced as the primary cross-collection identity mechanism but is never specified.",
+      "severity": "low",
+      "why_it_matters": "URNs appear in the MemoryHeader (`urn`, `parent_urn`), the embeddings table key (`subject_urn`), and the relational graph. Without a defined syntax (namespace hierarchy, allowed characters, uniqueness scope), two plugins could independently generate colliding or unparseable URNs.",
+      "suggested_delta": "The V1 ADD should include a URN specification section: format (e.g., `urn:caelator:{plugin}:{type}:{id}`), uniqueness guarantees, and whether URNs are opaque handles or parseable identifiers.",
+      "evidence": "Section 8: 'attaching a globally unique urn, workspace_id, and origin_plugin' — URN is used as a primary key but its format is undefined."
+    },
+    {
+      "issue": "The task description states LanceDB is 'already used by research-radar for embeddings' but the plan correctly notes research-radar uses SQLite with LIKE matching and has no embedding infrastructure.",
+      "severity": "low",
+      "why_it_matters": "If stakeholders read the task framing and assume existing LanceDB integration exists in research-radar, they may underestimate migration effort or skip embedding model selection from the V1 scope.",
+      "suggested_delta": "Add an explicit note in the ADD's migration matrix that research-radar's LanceDB migration is greenfield (no existing embeddings to port), and that embedding model selection is a prerequisite blocking the migration, not an implementation detail.",
+      "evidence": "Section 3: 'research-radar currently uses SQLite with keyword LIKE matching and does not actually have an embedding infrastructure yet.'"
+    },
+    {
+      "issue": "The `QueryPlanner` capability interface is listed alongside domain-specific stores but its responsibilities overlap ambiguously with the other interfaces.",
+      "severity": "low",
+      "why_it_matters": "If `EntityStore` already supports filtered queries and `SemanticIndex` handles vector search, it is unclear what `QueryPlanner` adds. Plugin authors may bypass it or duplicate query logic, creating inconsistent access patterns.",
+      "suggested_delta": "Either define QueryPlanner's unique responsibility (e.g., cross-collection joins, query optimization, hybrid structured+vector queries) or remove it from the V1 API surface and defer to V2 when real usage patterns emerge.",
+      "evidence": "Section 4: 'EntityStore, RelationStore, SemanticIndex, EventLog, QueryPlanner' — QueryPlanner is the only interface without a corresponding canonical table or clear domain."
+    }
+  ],
+  "things_to_keep": [
+    "Dedicated embeddings table decoupled from domain collections — this is the single best architectural decision in the plan, enabling model migration and multi-domain semantic search without schema churn in every collection.",
+    "Hybrid approach exempting append-only audit logs from LanceDB — correctly avoids forcing non-semantic temporal data into a vector store, reducing schema complexity.",
+    "Compile-time crate dependency model over runtime broker/RPC — idiomatic Rust, catches integration errors at compile time, avoids the complexity of a service mesh for a single-user local tool.",
+    "Migration mapping matrix as a V1 validation artifact — forces concrete confrontation with real data shapes rather than hand-waving about 'just move it over'.",
+    "Greenfield vector space recognition for research-radar — correctly identifies the opportunity to set embedding standards from scratch rather than inheriting technical debt."
+  ],
+  "schema_version": 1
+}

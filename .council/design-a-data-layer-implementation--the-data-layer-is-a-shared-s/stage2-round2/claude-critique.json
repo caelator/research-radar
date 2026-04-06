@@ -1,0 +1,41 @@
+{
+  "reviewer_role": "adversarial-reviewer/conceptual-risk",
+  "critiques": [
+    {
+      "issue": "Tombstone-based soft-delete creates an unbounded growth problem with no defined compaction or reaping policy",
+      "severity": "medium",
+      "why_it_matters": "Section 8 step 6 says canonical records are tombstoned rather than hard-deleted so append-only logs never reference vanished URNs. But the plan never defines when tombstones can be reaped. Over months of use the canonical tables accumulate dead rows that degrade query performance and inflate storage, yet removing them risks breaking the very log-referential-integrity guarantee tombstones exist to provide. Without a compaction policy (e.g., tombstones older than X days with no live log references may be purged), V2 implementers will either never compact — causing performance decay — or compact ad-hoc and silently break audit log integrity.",
+      "suggested_delta": "Add a tombstone lifecycle rule to Section 4 Schema Evolution: define a minimum retention period, a reference-check precondition for reaping (no live audit log references younger than the retention window), and require `layers_data::migrate()` to include a compaction pass.",
+      "evidence": "Section 8 step 6: 'canonical records they reference are tombstoned rather than hard-deleted'"
+    },
+    {
+      "issue": "The `projections` table has a composite key but no invalidation or staleness contract",
+      "severity": "low",
+      "why_it_matters": "Projections are defined as 'derived, rebuildable read models' keyed by `(projection_name, subject_urn, version)` but the plan does not specify what triggers a rebuild, how consumers detect staleness, or whether reads from a stale projection silently return outdated data. Without this, plugin authors will either poll-rebuild wastefully or serve stale results without knowing it.",
+      "suggested_delta": "In Section 4 under the projections bullet, add: projections must carry a `built_from_version` field referencing the source entity's last-modified version; `SemanticIndex`/`QueryPlanner` must compare this against the live entity version and either reject or lazily rebuild stale projections.",
+      "evidence": "Section 4: 'projections: derived, rebuildable read models/materializations keyed by (projection_name, subject_urn, version); never the system of record'"
+    },
+    {
+      "issue": "The classification rule for LanceDB-canonical vs. filesystem-audit is stated as a principle but never given as a concrete decision procedure",
+      "severity": "low",
+      "why_it_matters": "Section 3 says data goes to filesystem 'only if it is append-only, never queried cross-plugin, and not semantically searchable,' but the migration matrix in Section 10 asks authors to classify every artifact using 'the rule above.' A three-predicate conjunction applied by different plugin authors will produce inconsistent classifications for borderline cases (e.g., council debate transcripts — append-only but potentially cross-plugin searchable). Without a tiebreaker or worked ambiguous example, the migration matrix will have classification disagreements.",
+      "suggested_delta": "Add a tiebreaker clause: 'If any predicate is uncertain, default to LanceDB canonical. The ADD must include at least one worked borderline example showing how the three predicates are evaluated.'",
+      "evidence": "Section 3: 'keep data filesystem-local only if it is append-only, never queried cross-plugin, and not semantically searchable'"
+    },
+    {
+      "issue": "Write coordinator is described as cross-process but the concurrency walkthrough only requires a 'representative multi-plugin write scenario'",
+      "severity": "low",
+      "why_it_matters": "A cross-process write coordinator (file locks, named semaphores, or a daemon) has fundamentally different failure modes than an in-process mutex — stale locks after crashes, platform-specific behavior, no poison detection. The validation plan's concurrency walkthrough should explicitly require a crash-recovery scenario, not just a happy-path multi-writer scenario, or V2 will ship a lock that deadlocks after an ungraceful exit.",
+      "suggested_delta": "In Section 10 Concurrency Walkthrough, add: 'Must include a crash-recovery scenario demonstrating that a writer crash does not permanently block subsequent writers.'",
+      "evidence": "Section 4: 'initial design target: a cross-process write coordinator/lock wrapper so only one writer commits at a time'; Section 10: 'a representative multi-plugin write scenario'"
+    }
+  ],
+  "things_to_keep": [
+    "The URN identity spec with explicit format, uniqueness scope, and the opaque-for-logic/parseable-for-diagnostics duality — this prevents the single most common integration bug in multi-plugin systems",
+    "Dedicated embeddings table decoupled from domain schemas — this is the right call for model migration without churning entity tables",
+    "The canonical-vs-audit classification rule as a first-class architectural boundary rather than an implementation detail",
+    "Schema versioning with plugin-declared supported ranges rather than assuming HEAD — this prevents the silent breakage that kills plugin ecosystems",
+    "Requiring the migration matrix to include one worked end-to-end example per plugin — this forces the ADD author to validate feasibility rather than hand-wave"
+  ],
+  "schema_version": 1
+}

@@ -1,0 +1,39 @@
+{
+  "reviewer_role": "adversarial-reviewer/implementation-risk",
+  "critiques": [
+    {
+      "issue": "Lack of a concrete concurrency management strategy for LanceDB writes.",
+      "severity": "high",
+      "why_it_matters": "LanceDB's MVCC supports concurrent reads, but concurrent writes to the same dataset from multiple processes (plugins) can lead to transaction conflicts or data corruption. If the architecture does not mediate writes, the shared data layer will fail under concurrent ecosystem load.",
+      "suggested_delta": "Update the V1 Scope and API Surface Design to mandate a centralized write-mediation pattern in `layers-data` (e.g., a single writer actor/daemon, or a strict cross-process file-locking wrapper) rather than just leaving concurrency as an 'open question'.",
+      "evidence": "Section 9: 'The design must validate whether LanceDB's concurrency guarantees can safely replace openclaw-pm's strict locking patterns...'"
+    },
+    {
+      "issue": "No mechanism specified to prevent vector drift in the dedicated embeddings table.",
+      "severity": "medium",
+      "why_it_matters": "Because embeddings are stored in a separate table from the domain entities, deleting or updating a source entity without native database triggers will leave orphaned or stale vectors, degrading semantic search accuracy over time.",
+      "suggested_delta": "Require the `layers-data` API to implement application-level cascading deletes and upserts. The EntityStore must automatically synchronize changes to the SemanticIndex table within the same API call.",
+      "evidence": "Section 3: 'semantic search will flow through a central `embeddings` table. This makes multi-collection retrieval... much more efficient.'"
+    },
+    {
+      "issue": "Relational integrity boundary between LanceDB and file-based logs is undefined.",
+      "severity": "medium",
+      "why_it_matters": "By keeping audit streams in files while entities live in LanceDB, entities might be deleted or mutated while file logs still reference them. This breaks the ability to reconstruct accurate historical traces.",
+      "suggested_delta": "Explicitly define a lifecycle policy in the Architecture Design Document for cross-boundary references, such as mandating 'soft deletes' (tombstoning) in LanceDB to ensure file-based logs never point to missing URNs.",
+      "evidence": "Section 2, Approach C: 'exempt pure temporal audit streams... retaining them as file-based append-only logs.'"
+    },
+    {
+      "issue": "Indecision on workspace isolation architecture.",
+      "severity": "low",
+      "why_it_matters": "Failing to commit to either a single global store with workspace keys OR multiple workspace-relative stores leaves a massive API design hole that will block V2 implementation.",
+      "suggested_delta": "Mandate that the V1 Architecture Design Document must make a definitive decision between the two isolation models rather than accommodating both loosely.",
+      "evidence": "Section 7: 'reside in a workspace-relative LanceDB instance... or utilize a strict workspace-keying scheme within the global store.'"
+    }
+  ],
+  "things_to_keep": [
+    "The decision to separate the embeddings table from domain tables (Approach C) is an excellent choice for model migration and unified semantic search.",
+    "The strict requirement for a migration mapping matrix is highly pragmatic and reduces the risk of data loss.",
+    "Introducing vector spaces explicitly as a schema constraint."
+  ],
+  "schema_version": 1
+}

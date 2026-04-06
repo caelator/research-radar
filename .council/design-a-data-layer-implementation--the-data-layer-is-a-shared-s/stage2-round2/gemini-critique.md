@@ -1,0 +1,38 @@
+{
+  "reviewer_role": "adversarial-reviewer/implementation-risk",
+  "critiques": [
+    {
+      "issue": "LanceDB enforces strict fixed dimensionality for vector columns, making a single unified `embeddings` collection impossible if multiple models are used.",
+      "severity": "high",
+      "why_it_matters": "LanceDB uses Arrow's `FixedSizeList` for vectors. Storing e.g. OpenAI (1536d) and local MiniLM (384d) embeddings in the same table will cause hard runtime panics. The architecture will fail to compile or insert data.",
+      "suggested_delta": "Change the schema design to mandate collection-per-space (e.g., `embeddings_{space_id}`) or mandate a single, globally enforced ecosystem-wide embedding model and dimensionality.",
+      "evidence": "embeddings: semantic index rows keyed by (subject_urn, space_id, chunk_id)"
+    },
+    {
+      "issue": "Cross-process write locks are highly vulnerable to process crashes, risking ecosystem-wide deadlocks.",
+      "severity": "medium",
+      "why_it_matters": "If a Caelator plugin process segfaults, OOMs, or is SIGKILLed while holding the embedded LanceDB write lock, the database becomes permanently locked. All other plugins will block indefinitely until manual user intervention.",
+      "suggested_delta": "Require the ADD to define a crash-safe write coordination mechanism (e.g., lock leases with timeouts, stale-lock detection and recovery, or delegating writes to a dedicated daemon).",
+      "evidence": "initial design target: a cross-process write coordinator/lock wrapper so only one writer commits at a time"
+    },
+    {
+      "issue": "Bulk re-embedding migrations will starve all other plugins due to the single-writer constraint.",
+      "severity": "medium",
+      "why_it_matters": "Re-embedding thousands of nodes during a model upgrade is a long-running operation. Holding a single-writer lock for the duration will paralyze the entire agent ecosystem, preventing any state updates or logging.",
+      "suggested_delta": "The ADD must specify a strategy for long-running writes: either chunked transactions that periodically yield the lock, or a shadow-collection build followed by an atomic pointer swap.",
+      "evidence": "single-writer mediation pattern [...] re-embedding triggers must be finalized in the ADD."
+    },
+    {
+      "issue": "Opaque URNs prevent efficient structured filtering by domain or entity kind.",
+      "severity": "low",
+      "why_it_matters": "Forcing the query planner to do string prefix matching (`LIKE 'urn:caelator:openclaw:%'`) on URNs is inefficient compared to exact-match filtering on dictionary-encoded columns.",
+      "suggested_delta": "Add explicit `domain` and `kind` columns to the `entities` table to allow fast, indexed structured filtering, keeping the URN string as just the unique primary key.",
+      "evidence": "URNs are opaque for logic but parseable for diagnostics."
+    }
+  ],
+  "things_to_keep": [
+    "The explicit definition of `projections` to prevent derived data from becoming the system of record.",
+    "The clear boundary rule for what goes in LanceDB (queryable state) vs the filesystem (append-only audit logs).",
+    "Tombstoning canonical records instead of hard-deleting them to preserve integrity with file-based logs."
+  ]
+}
