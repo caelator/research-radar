@@ -250,12 +250,35 @@ impl DbPool {
         )?;
         Ok(result.id.clone())
     }
+
+    // ─── Source listing ────────────────────────────────────────────────
+
+    /// List all sources, ordered by most recently added.
+    pub fn list_sources(&self, limit: usize) -> Result<Vec<Source>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, url, title, source_type, added_at FROM sources \
+             ORDER BY added_at DESC LIMIT ?1",
+        )?;
+        let mut sources = Vec::new();
+        let mut rows = stmt.query(params![limit as i64])?;
+        while let Some(row) = rows.next()? {
+            sources.push(Self::row_to_source(row)?);
+        }
+        Ok(sources)
+    }
+
+    /// Count total sources in the database.
+    pub fn count_sources(&self) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM sources", [], |row| row.get(0))?;
+        Ok(count as usize)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     fn memory_pool() -> DbPool {
         let conn = Connection::open_in_memory().unwrap();
@@ -322,5 +345,79 @@ mod tests {
 
         let entries = pool.search_entries("query", 5).unwrap();
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn list_sources_returns_newest_first() {
+        let pool = memory_pool();
+        // Insert two sources (second one added last, so should appear first in list).
+        let src1 = Source::new("https://first.com".into(), "First Source".into(), SourceType::Paper);
+        let src2 = Source::new("https://second.com".into(), "Second Source".into(), SourceType::Article);
+        pool.insert_source(&src1).unwrap();
+        pool.insert_source(&src2).unwrap();
+
+        let sources = pool.list_sources(10).unwrap();
+        assert_eq!(sources.len(), 2);
+        // Most recently added first
+        assert_eq!(sources[0].id, src2.id);
+        assert_eq!(sources[1].id, src1.id);
+    }
+
+    #[test]
+    fn list_sources_respects_limit() {
+        let pool = memory_pool();
+        for i in 0..5 {
+            let src = Source::new(
+                format!("https://example{i}.com"),
+                format!("Source {i}"),
+                SourceType::Web,
+            );
+            pool.insert_source(&src).unwrap();
+        }
+
+        let sources = pool.list_sources(3).unwrap();
+        assert_eq!(sources.len(), 3);
+    }
+
+    #[test]
+    fn count_sources_returns_total() {
+        let pool = memory_pool();
+        assert_eq!(pool.count_sources().unwrap(), 0);
+
+        let src = Source::new("https://example.com".into(), "Example".into(), SourceType::Web);
+        pool.insert_source(&src).unwrap();
+        assert_eq!(pool.count_sources().unwrap(), 1);
+
+        let src2 = Source::new("https://other.com".into(), "Other".into(), SourceType::Paper);
+        pool.insert_source(&src2).unwrap();
+        assert_eq!(pool.count_sources().unwrap(), 2);
+    }
+
+    #[test]
+    fn search_records_radar_result_per_entry() {
+        let pool = memory_pool();
+        let src = Source::new("https://example.com".into(), "Example".into(), SourceType::Web);
+        pool.insert_source(&src).unwrap();
+
+        // Insert two entries
+        let entry1 = Entry::new(src.id.clone(), "AI safety research paper".into());
+        let entry2 = Entry::new(src.id.clone(), "AI alignment techniques".into());
+        pool.insert_entry(&entry1).unwrap();
+        pool.insert_entry(&entry2).unwrap();
+
+        let q = RadarQuery::new("AI".into());
+        let query_id = pool.log_query(&q).unwrap();
+        let entries = pool.search_entries("AI", 10).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        // Record a result for each entry
+        for entry in &entries {
+            let result = RadarResult::new(query_id.clone(), entry.id.clone(), entry.relevance_score);
+            pool.insert_result(&result).unwrap();
+        }
+
+        // Verify both results were recorded
+        let all_entries = pool.search_entries("AI", 10).unwrap();
+        assert_eq!(all_entries.len(), 2);
     }
 }

@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use research_radar_core::{
-    DbPool, Entry, RadarQuery, Source, SourceType,
+    DbPool, RadarQuery, RadarResult, Source, SourceType,
 };
 
 #[derive(Parser)]
@@ -105,9 +105,13 @@ fn main() {
 
         Commands::Search { query, limit } => {
             let q = RadarQuery::new(query.clone());
-            if let Err(e) = pool.log_query(&q) {
-                eprintln!("warning: failed to log query: {e}");
-            }
+            let query_id = match pool.log_query(&q) {
+                Ok(id) => id,
+                Err(e) => {
+                    eprintln!("warning: failed to log query: {e}");
+                    String::new()
+                }
+            };
 
             let entries = match pool.search_entries(&query, limit) {
                 Ok(results) => results,
@@ -116,6 +120,16 @@ fn main() {
                     std::process::exit(1);
                 }
             };
+
+            // Record each result so we can later analyze retrieval quality.
+            if !query_id.is_empty() {
+                for entry in &entries {
+                    let result = RadarResult::new(query_id.clone(), entry.id.clone(), entry.relevance_score);
+                    if let Err(e) = pool.insert_result(&result) {
+                        eprintln!("warning: failed to record result for entry {}: {e}", entry.id);
+                    }
+                }
+            }
 
             if entries.is_empty() {
                 println!("no entries found for \"{query}\"");
@@ -135,16 +149,22 @@ fn main() {
         }
 
         Commands::List { limit } => {
-            // Simple list via in-memory scan (small-scale for now).
-            let _all_entries: Vec<Entry> = pool
-                .search_entries("", limit)
-                .unwrap_or_default();
+            let total = pool.count_sources().unwrap_or(0);
+            let sources = pool.list_sources(limit).unwrap_or_default();
 
-            // We want all sources, so we'll do a direct query.
-            // For Phase 1 simplicity, just print a placeholder count.
-            // A full "list sources" would be a separate pool method.
-            println!("sources stored (showing up to {limit}):");
-            println!("  (source listing — use `search` to find entries)");
+            if sources.is_empty() {
+                println!("no sources stored yet — add one with `research-radar add <url>`");
+                return;
+            }
+
+            println!("{} source(s) stored (showing up to {limit}):\n", total);
+            for src in &sources {
+                println!("  [{}] {}", src.source_type.as_str(), src.id);
+                println!("  title  : {}", truncate(&src.title, 80));
+                println!("  url    : {}", truncate(&src.url, 80));
+                println!("  added  : {}", src.added_at.format("%Y-%m-%d"));
+                println!();
+            }
         }
 
         Commands::DbPath => {
