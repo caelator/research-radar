@@ -1,1 +1,0 @@
-MappedRows<'_, for<'a, 'b> fn(&'a Row<'b>) -> std::result::Result<Source, StorageError> {storage::DbPool::row_to_source}>
