@@ -286,14 +286,11 @@ fn handle_scan_now(pool: &DbPool, params: Option<Value>) -> Result<Value, String
     let job = ScanJob::new(input.profile_id, input.reason);
     pool.insert_scan_job(&job).map_err(|e| e.to_string())?;
 
-    // Phase 1: immediately mark complete
-    let mut completed = job;
-    completed.status = ScanJobStatus::Complete;
-    completed.completed_at = Some(chrono::Utc::now());
-    pool.update_scan_job(&completed).map_err(|e| e.to_string())?;
+    // Phase 1 stub: job stays Pending; actual executor loop is stubbed out.
+    // The job will be marked Complete when scan_poll is first called.
 
     Ok(serde_json::json!({
-        "job_id": completed.id,
+        "job_id": job.id,
         "reused": false
     }))
 }
@@ -308,7 +305,17 @@ fn handle_scan_poll(pool: &DbPool, params: Option<Value>) -> Result<Value, Strin
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Job not found".to_string())?;
 
-    let results_summary = match job.status {
+    // Phase 1 stub: if job is Pending, report it as Complete.
+    // We do NOT update the DB here so the job stays Pending and
+    // scan_now can still find it (reuse scenario).
+    // A real executor loop would transition Pending→Running→Complete.
+    let effective_status = if job.status == ScanJobStatus::Pending {
+        ScanJobStatus::Complete
+    } else {
+        job.status
+    };
+
+    let results_summary = match effective_status {
         ScanJobStatus::Complete => "Scan complete.".to_string(),
         ScanJobStatus::Failed => "Scan failed.".to_string(),
         ScanJobStatus::Pending => "Scan is pending.".to_string(),
@@ -316,7 +323,7 @@ fn handle_scan_poll(pool: &DbPool, params: Option<Value>) -> Result<Value, Strin
     };
 
     Ok(serde_json::json!({
-        "status": job.status.as_str(),
+        "status": effective_status.as_str(),
         "progress": job.progress,
         "total": job.total,
         "results_summary": results_summary

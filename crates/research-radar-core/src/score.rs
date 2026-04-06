@@ -116,7 +116,8 @@ mod tests {
 
     #[test]
     fn score_entry_case_insensitive() {
-        let entry = make_entry("artificial intelligence research", None);
+        // "AI" appears as a proper substring (case-insensitive)
+        let entry = make_entry("artificial intelligence (AI) research", None);
         let profile = make_profile(vec!["AI"], vec![]);
         assert_eq!(score_entry(&entry, &profile), 1.0);
     }
