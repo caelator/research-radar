@@ -272,7 +272,9 @@ pub struct ScoredMatch {
 
 // ─── Re-exports ──────────────────────────────────────────────────────
 
+pub mod executor;
 pub mod score;
 pub mod storage;
+pub use executor::{PipelineExecutor, PipelineRun};
 pub use score::score_entry;
 pub use storage::{DbPool, SourceHealth, StorageError};

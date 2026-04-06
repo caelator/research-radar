@@ -12,7 +12,7 @@
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use research_radar_core::{DbPool, RadarQuery, RadarResult, Source, SourceType};
+use research_radar_core::{DbPool, PipelineExecutor, RadarQuery, RadarResult, Source, SourceType};
 
 mod mcp_server;
 
@@ -61,6 +61,9 @@ enum Commands {
 
     /// Show the database path being used.
     DbPath,
+
+    /// Process one pending scan job synchronously.
+    ScanOnce,
 
     /// Start the MCP JSON-RPC server (stdio).
     Mcp,
@@ -174,6 +177,24 @@ fn main() {
         Commands::DbPath => {
             let home = dirs::home_dir().unwrap_or_default();
             println!("{}/.research-radar/data.db", home.display());
+        }
+
+        Commands::ScanOnce => {
+            let executor = PipelineExecutor::new();
+            match executor.run_next(&pool) {
+                Ok(Some(run)) => {
+                    println!("processed job {} for profile {}", run.job_id, run.profile_id);
+                    println!("  candidates : {}", run.candidates);
+                    println!("  deduped    : {}", run.deduped);
+                    println!("  scored     : {}", run.scored);
+                    println!("  accepted   : {}", run.accepted);
+                }
+                Ok(None) => println!("no pending scan jobs"),
+                Err(e) => {
+                    eprintln!("error: scan-once failed: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
 
         Commands::Mcp => {

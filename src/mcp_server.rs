@@ -3,7 +3,7 @@
 //! Reads JSON-RPC requests from stdin, writes responses to stdout.
 
 use research_radar_core::{
-    DbPool, Profile, ScanJob, ScanJobStatus, ScoredMatch, SourceHealth, Subscription,
+    DbPool, Profile, ScanJobStatus, ScoredMatch, SourceHealth, Subscription,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -283,15 +283,18 @@ fn handle_scan_now(pool: &DbPool, params: Option<Value>) -> Result<Value, String
         }
     }
 
-    let job = ScanJob::new(input.profile_id, input.reason);
-    pool.insert_scan_job(&job).map_err(|e| e.to_string())?;
-
-    // Phase 1 stub: job stays Pending; actual executor loop is stubbed out.
-    // The job will be marked Complete when scan_poll is first called.
+    let job = if input.force == Some(true) {
+        let job = research_radar_core::ScanJob::new(input.profile_id.clone(), input.reason);
+        pool.insert_scan_job(&job).map_err(|e| e.to_string())?;
+        job
+    } else {
+        pool.enqueue_job(&input.profile_id, input.reason)
+            .map_err(|e| e.to_string())?
+    };
 
     Ok(serde_json::json!({
         "job_id": job.id,
-        "reused": false
+        "reused": job.status != ScanJobStatus::Pending
     }))
 }
 
@@ -305,17 +308,7 @@ fn handle_scan_poll(pool: &DbPool, params: Option<Value>) -> Result<Value, Strin
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Job not found".to_string())?;
 
-    // Phase 1 stub: if job is Pending, report it as Complete.
-    // We do NOT update the DB here so the job stays Pending and
-    // scan_now can still find it (reuse scenario).
-    // A real executor loop would transition Pending→Running→Complete.
-    let effective_status = if job.status == ScanJobStatus::Pending {
-        ScanJobStatus::Complete
-    } else {
-        job.status
-    };
-
-    let results_summary = match effective_status {
+    let results_summary = match job.status {
         ScanJobStatus::Complete => "Scan complete.".to_string(),
         ScanJobStatus::Failed => "Scan failed.".to_string(),
         ScanJobStatus::Pending => "Scan is pending.".to_string(),
@@ -323,7 +316,7 @@ fn handle_scan_poll(pool: &DbPool, params: Option<Value>) -> Result<Value, Strin
     };
 
     Ok(serde_json::json!({
-        "status": effective_status.as_str(),
+        "status": job.status.as_str(),
         "progress": job.progress,
         "total": job.total,
         "results_summary": results_summary
@@ -531,7 +524,6 @@ mod tests {
     fn test_scan_now_and_poll() {
         let pool = test_pool();
 
-        // Create a profile first
         let create_resp = rpc_call(
             &pool,
             "profile_create",
@@ -540,7 +532,6 @@ mod tests {
         let result = create_resp.result.as_ref().unwrap();
         let profile_id = result["profile_id"].as_str().unwrap();
 
-        // Scan now
         let scan_resp = rpc_call(
             &pool,
             "scan_now",
@@ -551,7 +542,15 @@ mod tests {
         let job_id = scan_result["job_id"].as_str().unwrap();
         assert_eq!(scan_result["reused"], false);
 
-        // Poll
+        let scan_resp2 = rpc_call(
+            &pool,
+            "scan_now",
+            serde_json::json!({"profile_id": profile_id}),
+        );
+        let scan_result2 = scan_resp2.result.as_ref().unwrap();
+        assert_eq!(scan_result2["job_id"].as_str().unwrap(), job_id);
+        assert_eq!(scan_result2["reused"], true);
+
         let poll_resp = rpc_call(
             &pool,
             "scan_poll",
@@ -559,16 +558,7 @@ mod tests {
         );
         assert!(poll_resp.error.is_none());
         let poll_result = poll_resp.result.as_ref().unwrap();
-        assert_eq!(poll_result["status"].as_str().unwrap(), "complete");
-
-        // Re-scan should reuse
-        let scan_resp2 = rpc_call(
-            &pool,
-            "scan_now",
-            serde_json::json!({"profile_id": profile_id}),
-        );
-        let scan_result2 = scan_resp2.result.as_ref().unwrap();
-        assert_eq!(scan_result2["reused"], true);
+        assert_eq!(poll_result["status"].as_str().unwrap(), "pending");
     }
 
     #[test]

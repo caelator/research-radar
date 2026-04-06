@@ -8,6 +8,7 @@ use rusqlite::{params, Connection};
 use std::path::PathBuf;
 
 use crate::{Entry, Profile, RadarQuery, RadarResult, ScanJob, ScanJobStatus, ScoredMatch, Source, SourceType, Subscription};
+use uuid::Uuid;
 
 // ─── Error ───────────────────────────────────────────────────────────
 
@@ -257,6 +258,54 @@ impl DbPool {
         })
     }
 
+    pub fn list_entries(&self, source_ids: Option<&[String]>) -> Result<Vec<Entry>> {
+        let mut entries = Vec::new();
+
+        if let Some(source_ids) = source_ids {
+            if source_ids.is_empty() {
+                return Ok(entries);
+            }
+
+            let placeholders = (0..source_ids.len())
+                .map(|idx| format!("?{}", idx + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id, source_id, content, summary, tags, relevance_score, last_reread_at \
+                 FROM entries WHERE source_id IN ({}) ORDER BY relevance_score DESC, id ASC",
+                placeholders
+            );
+            let params: Vec<&dyn rusqlite::ToSql> = source_ids
+                .iter()
+                .map(|id| id as &dyn rusqlite::ToSql)
+                .collect();
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params.as_slice(), Self::row_to_entry)?;
+            for row in rows {
+                entries.push(row?);
+            }
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, source_id, content, summary, tags, relevance_score, last_reread_at \
+                 FROM entries ORDER BY relevance_score DESC, id ASC",
+            )?;
+            let rows = stmt.query_map([], Self::row_to_entry)?;
+            for row in rows {
+                entries.push(row?);
+            }
+        }
+
+        Ok(entries)
+    }
+
+    pub fn update_entry_relevance(&self, entry_id: &str, score: f64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE entries SET relevance_score = ?2, last_reread_at = ?3 WHERE id = ?1",
+            params![entry_id, score, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     /// Simple keyword search over entries (LIKE-based). Returns up to `top_k` results
     /// ordered by relevance_score DESC.
     ///
@@ -314,6 +363,29 @@ impl DbPool {
         )?;
         let mut sources = Vec::new();
         let mut rows = stmt.query(params![limit as i64])?;
+        while let Some(row) = rows.next()? {
+            sources.push(Self::row_to_source(row)?);
+        }
+        Ok(sources)
+    }
+
+    pub fn list_sources_by_ids(&self, ids: &[String]) -> Result<Vec<Source>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders = (0..ids.len())
+            .map(|idx| format!("?{}", idx + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT id, url, title, source_type, added_at FROM sources WHERE id IN ({}) ORDER BY added_at DESC",
+            placeholders
+        );
+        let params: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params.as_slice())?;
+        let mut sources = Vec::new();
         while let Some(row) = rows.next()? {
             sources.push(Self::row_to_source(row)?);
         }
@@ -429,6 +501,16 @@ impl DbPool {
 
     // ─── ScanJob operations ──────────────────────────────────────────
 
+    pub fn enqueue_job(&self, profile_id: &str, reason: Option<String>) -> Result<ScanJob> {
+        if let Some(job) = self.get_active_scan_job(profile_id)? {
+            return Ok(job);
+        }
+
+        let job = ScanJob::new(profile_id.to_string(), reason);
+        self.insert_scan_job(&job)?;
+        Ok(job)
+    }
+
     /// Insert a new ScanJob. Returns the job id.
     pub fn insert_scan_job(&self, job: &ScanJob) -> Result<String> {
         self.conn.execute(
@@ -482,6 +564,43 @@ impl DbPool {
             created_at,
             completed_at,
         })
+    }
+
+    pub fn claim_next_scan_job(&self) -> Result<Option<ScanJob>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM scan_jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let id: String = row.get(0)?;
+        self.claim_scan_job(&id)
+    }
+
+    pub fn claim_scan_job(&self, job_id: &str) -> Result<Option<ScanJob>> {
+        let job = match self.get_scan_job(job_id)? {
+            Some(job) => job,
+            None => return Ok(None),
+        };
+
+        if job.status != ScanJobStatus::Pending {
+            return Ok(None);
+        }
+
+        self.conn.execute(
+            "UPDATE scan_jobs SET status = 'running' WHERE id = ?1 AND status = 'pending'",
+            params![job_id],
+        )?;
+        self.get_scan_job(job_id)
+    }
+
+    pub fn fail_scan_job(&self, job_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE scan_jobs SET status = 'failed', completed_at = ?2 WHERE id = ?1",
+            params![job_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
     }
 
     /// Update a ScanJob.
@@ -617,7 +736,7 @@ impl DbPool {
         score: f64,
         disposition: &str,
     ) -> Result<String> {
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = Uuid::new_v4().to_string();
         self.conn.execute(
             "INSERT INTO item_scores (id, entry_id, profile_id, score, disposition) \
              VALUES (?1, ?2, ?3, ?4, ?5) \
