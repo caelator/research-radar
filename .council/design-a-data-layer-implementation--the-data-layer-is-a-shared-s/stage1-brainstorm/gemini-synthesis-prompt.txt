@@ -1,0 +1,133 @@
+You are the brainstorming lead synthesizing contributions into a revised plan.
+
+Original plan:
+## 1. Goal and constraints
+- **Goal**: Design a unified, shared data layer embedded within the `layers` codebase to serve as the single source of truth for all Caelator ecosystem plugins (`council`, `openclaw-pm`, `research-radar`, `evolve`).
+- **Constraint**: Must strictly use LanceDB as the underlying vector and structured data store. No alternative databases may be considered.
+- **Constraint**: The data layer must support both semantic (vector) search and structured (relational/metadata) queries natively.
+- **Constraint**: Plugins must cease maintaining isolated persistent storage silos; the design must prevent data duplication across the ecosystem.
+- **Constraint**: This phase is strictly for architectural design and documentation; no Rust implementation or plugin refactoring is to be executed yet.
+
+## 2. Candidate approaches
+
+### Approach A: Single Monolithic Collection (The "Everything Bagel")
+- **Concept**: A single LanceDB collection (`caelator_memory`) stores every entity across all plugins. It uses a flexible schema with a generic `vector` column, standard metadata (`id`, `plugin_source`, `timestamp`, `type`), and a flexible JSON/Blob column for plugin-specific payload data.
+- **Tradeoffs**:
+  - *Pros*: Trivial cross-plugin semantic search (one query searches everything). Minimal collection management overhead.
+  - *Cons*: Highly sparse data structures. Loss of strong typing at the database level (requires heavy serialization/deserialization logic in Rust). Mixing disparate embedding types (e.g., code snippets vs. task descriptions) in a single vector space degrades semantic search quality.
+
+### Approach B: Domain-Specific Collections with a Unified Relational Graph
+- **Concept**: Define a fixed set of core, strongly-typed domain collections in LanceDB (e.g., `Documents/Snippets` for `research-radar`, `Tasks/Plans` for `openclaw-pm`, `Conversations/Events` for `council`). All collections share a mandatory "Unified Memory Header" (standardized fields like `urn`, `parent_urn`, `tags`, `embedding`) to allow cross-referencing and ecosystem-wide filtering.
+- **Tradeoffs**:
+  - *Pros*: Preserves strong Rust typing. Maintains separate, optimized vector spaces for different semantic domains. Cleaner schema evolution per domain.
+  - *Cons*: Cross-domain semantic searches require multi-collection queries and aggregation in the `layers` application logic. Slightly more complex initialization and schema management.
+
+## 3. Recommended approach with rationale
+**Recommended: Approach B (Domain-Specific Collections with a Unified Relational Graph)**
+- **Rationale**: Rust thrives on strong typing, and LanceDB's Arrow-backed storage is most performant when schemas are well-defined and dense. A monolithic JSON-blob approach defeats the purpose of a structured store.
+- **Unified Memory Language**: By enforcing a standard `MemoryHeader` struct on every domain collection, plugins can still perform ecosystem-wide operations (e.g., "delete all data related to project X" or "find all entities tagged with 'urgent'").
+- **Vector Space Integrity**: `research-radar` embeds source code, while `openclaw-pm` embeds natural language tasks. Forcing these into the same vector space degrades cosine similarity reliability. Separate collections ensure semantic boundaries are respected while the `layers` API provides unified access.
+
+## 4. V1 scope
+- **Deliverable**: A comprehensive markdown Architecture Design Document (ADD).
+- **Schema Definition**: Definition of the "Unified Memory Language" (the shared Rust traits and struct headers) and the specific LanceDB table schemas for the core domains (`Nodes`, `Edges`, `Documents`, `Tasks`).
+- **API Surface Design**: Interface definitions for the `layers` data broker (e.g., `pub trait DataLayer { fn query_semantic(...); fn insert_node(...); }`) and the plugin binding mechanism.
+- **Migration Strategy**: A concrete, step-by-step documented path for migrating `research-radar` from its isolated SQLite/custom store to the new `layers` LanceDB substrate.
+
+## 5. V2 / later
+- **Implementation**: Writing the actual Rust code in the `layers` codebase to instantiate the LanceDB connection and expose the APIs.
+- **Plugin Refactoring**: Updating `research-radar`, `council`, and `openclaw-pm` source code to consume the new `layers` API and deleting their isolated local storage mechanisms.
+- **Advanced Graph Queries**: Implementing multi-hop relational queries across LanceDB collections within the `layers` API layer.
+- **Data Sync**: Mechanisms for synchronizing local LanceDB storage across different developer machines or to a cloud backup.
+
+## 6. Out of scope / do not build
+- Evaluation, benchmarking, or consideration of any database other than LanceDB (e.g., SQLite, Qdrant, Chroma).
+- Writing any Rust implementation code for the data layer or modifying existing plugin codebases during this design phase.
+- Design of network-level synchronization protocols or multi-user concurrent access models (assume single-user local dev environment for now).
+- Designing generic data ingestors for non-Caelator external tools.
+
+## 7. Files, binaries, and storage
+- `docs/architecture/001-unified-data-layer.md`: The canonical output of this phase, detailing the schema, API, and migration plan.
+- `~/.caelator/store/*.lance`: The standardized local filesystem path where the `layers` core will eventually initialize and manage the LanceDB datasets. Plugins will no longer write to their own `~/.plugin-name/` directories.
+- `crates/layers-core/src/data/`: The conceptual directory within the `layers` codebase where the unified schema definitions and LanceDB broker implementations will reside in V2.
+
+## 8. Control flow
+1. **Initialization**: The Caelator runtime starts. The `layers` core initializes the single LanceDB connection pool pointing to `~/.caelator/store/`.
+2. **Schema Verification**: `layers` ensures all required unified collections (`Tasks`, `Documents`, etc.) exist and are up-to-date with the current schema.
+3. **Plugin Binding**: A plugin (e.g., `research-radar`) is loaded. It requests a `DataLayerHandle` from the `layers` host via the plugin API.
+4. **Write Path**: `research-radar` indexes a new file. It constructs a `Document` struct (implementing the Unified Memory trait) and calls `handle.insert(doc)`. `layers` routes this to the `Documents` LanceDB collection.
+5. **Read Path**: `council` needs context. It calls `handle.semantic_search(query_vector, vec!["Documents", "Tasks"])`. `layers` executes the vector search against the specified collections, normalizes the results into a unified `MemoryNode` format, and returns them to `council`.
+
+## 9. Risks and open questions
+- **LanceDB Rust API Maturity**: LanceDB's Rust SDK is evolving rapidly. Does it currently support all the complex filtering and cross-collection operations we require without dropping down to raw DataFusion queries?
+- **Schema Evolution**: How do we handle database migrations when the Unified Memory schema needs to change, given that multiple plugins depend on it simultaneously?
+- **Embedding Model Alignment**: If `research-radar` and `openclaw-pm` use different embedding models (e.g., text-embedding-3-small vs a local BERT), cross-collection semantic search will yield garbage results. The data layer design must dictate or track embedding model provenance.
+
+## 10. Validation plan
+- **Schema Desk-Check**: Map existing data structures from `research-radar` (e.g., its AST snippets) and `openclaw-pm` (e.g., task dependencies) to the proposed LanceDB schema to ensure no data loss or awkward serialization is required.
+- **API Walkthrough**: Write pseudocode for the top 3 most common plugin operations (insert document, find related tasks, retrieve conversation history) using the proposed `layers` API to verify developer ergonomics.
+- **Migration Dry-Run**: Document the exact script/process required to read `research-radar`'s current storage and write it to the proposed LanceDB schema to ensure the migration path is viable and performant.
+
+
+Elegance contributions:
+Here are my contributions after examining the actual codebases:
+
+---
+
+1. **Section: 2. Candidate approaches**
+   - **Suggest:** Add a third approach — "Hybrid: LanceDB for vector-bearing collections, retain file-based append logs for event streams." Council's JSONL traces and openclaw-pm's event logs are append-only audit trails that gain nothing from vector indexing. Forcing them into LanceDB collections adds schema complexity for data that is never queried semantically.
+   - **Why:** Council writes `RunTrace`, `PhaseMetrics`, and `LearningRecord` as JSONL append logs. Openclaw-pm writes `events.jsonl` and `archive.jsonl`. These are temporal audit streams, not semantic retrieval targets. The plan's all-or-nothing stance ("plugins must cease maintaining isolated persistent storage silos") conflates *shared queryable state* with *append-only operational logs*. Exempting pure event streams from the LanceDB mandate simplifies the schema by ~40% while still unifying the entities that actually benefit from cross-plugin search.
+
+2. **Section: 3. Recommended approach with rationale**
+   - **Suggest:** Replace the assertion that research-radar "embeds source code" with the actual state: research-radar uses SQLite with keyword `LIKE` matching and has zero embedding infrastructure. The `search_entries` method has a comment reading "In a future phase this will delegate to a proper vector store." The migration is from SQLite, not from an existing LanceDB setup.
+   - **Why:** The plan's rationale for separate vector spaces ("research-radar embeds source code, while openclaw-pm embeds natural language tasks") is built on a false premise. Neither plugin produces embeddings today. This changes the migration story significantly — you're not preserving existing vector spaces, you're introducing them for the first time, which means you can choose a single embedding model from the start and sidestep the cross-model compatibility problem entirely.
+
+3. **Section: 4. V1 scope**
+   - **Suggest:** Replace the abstract schema names (`Nodes`, `Edges`, `Documents`, `Tasks`) with names derived from the actual domain types that exist today. Concretely: `sources` + `entries` + `profiles` (from research-radar's 9 SQLite tables), `project_state` + `tasks` (from openclaw-pm's YAML state), `run_traces` + `plans` + `learnings` (from council's JSONL records). Map the real structs first, then abstract.
+   - **Why:** The current schema names are invented top-down without reference to any existing data structure. Research-radar has `Source`, `Entry`, `Profile`, `ScanJob`, `Subscription`, `ScoredMatch` — none of which map cleanly to "Nodes" or "Documents." Starting from concrete types and finding the natural shared abstractions (rather than imposing generic graph vocabulary) will produce a schema plugins can actually adopt without awkward impedance-mismatch wrappers.
+
+4. **Section: 8. Control flow**
+   - **Suggest:** Replace the `DataLayerHandle` broker pattern with a simpler model: `layers` exposes a typed Rust crate (`layers-data`) that plugins depend on directly as a library. Plugins call `layers_data::open(path)` and get back typed table handles. No "binding," no "requesting a handle from the host," no runtime brokering.
+   - **Why:** Every existing plugin already uses direct library calls for storage — research-radar calls `DbPool::init()`, openclaw-pm calls `fs2::File::open()`, council calls `std::fs::OpenOptions`. The plan introduces a runtime plugin-host negotiation pattern (`plugin requests DataLayerHandle from layers host`) that doesn't match how any of these plugins actually load. A compile-time crate dependency is simpler, type-safe, and idiomatic Rust. The "host grants handle" pattern only makes sense for dynamically loaded WASM plugins, which are out of scope.
+
+5. **Section: 9. Risks and open questions**
+   - **Suggest:** Add a risk: "Openclaw-pm uses file locking (`fs2` crate) with exclusive locks and atomic temp-file-rename writes for state mutations. LanceDB's concurrency model must be validated against this pattern — if LanceDB doesn't support single-writer file locking semantics, openclaw-pm's atomicity guarantees will silently degrade."
+   - **Why:** Openclaw-pm's `state.lock` mechanism and atomic `write_temp → fsync → rename` pattern are load-bearing correctness features, not incidental. The plan doesn't acknowledge that any existing plugin has concurrency controls, and LanceDB's MVCC behavior is different from exclusive file locks. This is a concrete compatibility hazard that should be called out.
+
+6. **Section: 7. Files, binaries, and storage**
+   - **Suggest:** Change `~/.caelator/store/*.lance` to a path that respects the existing convention. Research-radar stores data at `~/.research-radar/data.db`, openclaw-pm at `.openclaw/pm/` (workspace-relative). The design should specify whether storage is user-global (`~/.caelator/`) or workspace-relative, and document the migration for both `~/.research-radar/data.db` and `.openclaw/pm/state.yaml`. Currently the plan only mentions one path and ignores that openclaw-pm's storage is project-scoped, not user-scoped.
+   - **Why:** This is a hidden semantic conflict. Research-radar's data is global (all research across all projects in one DB). Openclaw-pm's data is per-workspace (each project has its own `.openclaw/pm/`). Forcing both into a single `~/.caelator/store/` either loses openclaw-pm's project isolation or requires a workspace-keying scheme that the plan doesn't address. This needs an explicit decision.
+
+7. **Section: 4. V1 scope (Migration Strategy)**
+   - **Suggest:** The migration strategy should be a mechanical SQLite-to-LanceDB table-by-table ETL for research-radar's 9 existing tables, not a conceptual "step-by-step documented path." Specify exactly: `sources` → `rr_sources` LanceDB table (5 columns, no vector), `entries` → `rr_entries` table (add embedding column, backfill with chosen model), `profiles` → `rr_profiles` (deserialize JSON keyword arrays into Arrow list columns). The 6 remaining tables (`queries`, `results`, `scan_jobs`, `subscriptions`, `item_scores`, and indexes) need explicit dispositions — migrate, drop, or defer.
+   - **Why:** Research-radar has 1020 lines of storage code with 25+ methods across 9 tables. A vague "migration path" will stall at implementation time when someone discovers that `item_scores` has a composite unique constraint (`entry_id, profile_id`) that needs a LanceDB equivalent, or that `scan_jobs` tracks ephemeral state that probably shouldn't be in a shared data layer at all. Concrete table-level decisions now prevent blocking questions later.
+
+
+Feasibility contributions:
+1. **Section: 4. V1 scope**
+   - **Suggest:** Expand the listed schema deliverables from `Nodes`, `Edges`, `Documents`, `Tasks` to a concrete minimum canonical set such as `entities`, `relations`, `artifacts`, `events`, `embeddings`, and `projections`, and require the ADD to define each table’s primary key, required columns, foreign-key-like reference fields, and ownership rules.
+   - **Why:** The current V1 scope names are too plugin-shaped and will force later redesign when `council` and `evolve` need conversation/event and derived-state storage. A stable shared language needs canonical primitives first, then plugin views on top.
+
+2. **Section: 3. Recommended approach with rationale**
+   - **Suggest:** Add a concrete rule that embeddings are not stored inline on every domain row; instead, use a separate `embeddings` collection keyed by `(subject_urn, embedding_space, embedding_model, embedding_version, chunk_id)` and make all semantic search flow through that index layer.
+   - **Why:** Storing vectors directly in each domain collection makes multi-collection retrieval, model migration, and re-embedding expensive and inconsistent. A dedicated embedding table preserves domain typing while giving one uniform retrieval surface.
+
+3. **Section: 8. Control flow**
+   - **Suggest:** Insert an explicit identity-and-namespace step between `Plugin Binding` and `Write Path`: every plugin must receive a scoped `PluginContext { plugin_id, workspace_id, capabilities }`, and every write must carry a globally unique `urn` plus `tenant/workspace` and `origin_plugin` fields enforced by `layers`.
+   - **Why:** Without enforced namespacing at bind time, plugins will collide on IDs, leak data across workspaces, and recreate silo behavior through ad hoc conventions. This is a control-plane concern, not something to leave implicit in schema docs.
+
+4. **Section: 4. V1 scope**
+   - **Suggest:** Require the API surface design to include capability-specific interfaces instead of one broad `DataLayer` trait, for example `EntityStore`, `RelationStore`, `SemanticIndex`, `EventLog`, and `QueryPlanner`, plus one plugin-facing `DataLayerHandle` that exposes only allowed capabilities.
+   - **Why:** A single catch-all trait will become unstable quickly and make plugin bindings too coarse. Splitting the surface now gives clearer ownership boundaries, safer plugin integration, and a more realistic path to incremental implementation inside `layers`.
+
+5. **Section: 9. Risks and open questions**
+   - **Suggest:** Convert `Embedding Model Alignment` from an open question into a design decision: define approved embedding spaces up front, require each vector to declare `space_id`, and state that cross-space search is disallowed unless `layers` provides an explicit fusion strategy.
+   - **Why:** If this stays unresolved, the whole “unified semantic store” claim is shaky. Cross-collection retrieval quality will silently fail unless the architecture treats embedding provenance and compatibility as first-class schema constraints.
+
+6. **Section: 10. Validation plan**
+   - **Suggest:** Add one required validation artifact: a full migration mapping matrix for `research-radar`, `openclaw-pm`, `council`, and `evolve` showing current persisted entity -> target unified schema rows -> deprecated local store path, with at least one worked end-to-end example per plugin.
+   - **Why:** The current validation plan is too centered on `research-radar`. That risks designing a shared substrate that only one plugin fits cleanly, which would surface too late in implementation when other plugins need incompatible shapes or duplicate persistence.
+
+
+Integrate the valuable suggestions. Produce the revised complete plan.
+Mark sections that changed with [CHANGED] tags.

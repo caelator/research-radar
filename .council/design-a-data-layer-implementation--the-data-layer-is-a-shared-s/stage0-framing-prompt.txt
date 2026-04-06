@@ -1,0 +1,26 @@
+You are the framing controller for an AI planning council.
+
+Given the task below, produce four sections as a single structured output.
+You MUST use the exact markdown headers shown below. Every section MUST contain
+at least 2-3 concrete, specific points (not vague generalities).
+
+## Problem Brief
+What specific problem are we solving? What does "done" look like in observable terms?
+
+## Constraints
+Hard constraints only — tech stack, time budget, scope limits, external dependencies.
+List each as a bullet point.
+
+## Success Criteria
+Measurable or testable criteria. Each criterion should be verifiable by a developer.
+
+## Out of Scope
+What we are explicitly NOT solving in this iteration. Be specific about boundaries.
+
+Do NOT include introductory text, disclaimers, or meta-commentary.
+Start directly with `## Problem Brief`.
+
+Task:
+Design a data layer implementation. The data layer is a shared storage and semantic retrieval substrate for the Caelator agent ecosystem. Requirements: (1) LanceDB as the backing vector/structured store, already used by research-radar for embeddings; (2) a unified memory schema — a shared data "language" that all plugins (layers, council, openclaw-pm, research-radar, evolve) speak and query instead of maintaining their own isolated stores; (3) the data layer is built into the layers codebase as the canonical shared substrate; (4) plugins stop duplicating storage and instead query this common semantic + structured store. The question: what is the best architecture, schema design, API surface, and integration pattern to make this real? Focus on: schema design for the unified memory language, LanceDB table/collection design, how layers exposes the data layer to plugins, how plugin-to-layer binding works, and what the migration path looks like for existing plugins that currently have their own storage.
+
+External Context (Retrieved by Layers):
