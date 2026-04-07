@@ -6,6 +6,7 @@
 //! - **Entry**: annotated slice of a Source (content, summary, tags, relevance score)
 //! - **RadarQuery**: a search/query log entry
 //! - **RadarResult**: a scored retrieval result linking a query to an entry
+//! - **Finding**: evaluated research result with urgency, impact, and citation — the evolve input contract
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -273,8 +274,11 @@ pub struct ScoredMatch {
 // ─── Re-exports ──────────────────────────────────────────────────────
 
 pub mod executor;
+pub mod finding;
 pub mod score;
 pub mod storage;
+
 pub use executor::{PipelineExecutor, PipelineRun};
+pub use finding::{Finding, PaperRef, UrgencyLevel};
 pub use score::score_entry;
 pub use storage::{DbPool, SourceHealth, StorageError};
