@@ -18,7 +18,7 @@ use uuid::Uuid;
 // Re-exports for backward compatibility.
 pub use self::lance_store::RadarStore;
 pub use self::sqlite::DbPool;
-pub use self::sqlite::{SourceHealth, StorageError};
+pub use self::sqlite::{SourceHealth, SourceHealthDetail, StorageError};
 
 // ─── SQLite (existing pipeline) ─────────────────────────────────────────────
 
@@ -117,6 +117,9 @@ mod sqlite {
                     scoring_prompt    TEXT,
                     score_threshold   REAL NOT NULL DEFAULT 0.5,
                     max_llm_calls     INTEGER NOT NULL DEFAULT 10,
+                    revision          INTEGER NOT NULL DEFAULT 1,
+                    last_seen_at      TEXT,
+                    archived_at       TEXT,
                     created_at        TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS scan_jobs (
@@ -126,6 +129,17 @@ mod sqlite {
                     progress      INTEGER NOT NULL DEFAULT 0,
                     total         INTEGER NOT NULL DEFAULT 0,
                     reason        TEXT,
+                    claimed_by    TEXT,
+                    lease_token   TEXT,
+                    lease_expires_at TEXT,
+                    heartbeat_at  TEXT,
+                    last_progress_at TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    profile_revision_at_enqueue INTEGER,
+                    llm_spend_microunits INTEGER NOT NULL DEFAULT 0,
+                    warnings_json TEXT,
+                    error_json    TEXT,
+                    progress_json TEXT,
                     created_at    TEXT NOT NULL,
                     completed_at  TEXT
                 );
@@ -159,6 +173,41 @@ mod sqlite {
                     UNIQUE(profile_id, item_id, channel)
                 );
                 CREATE INDEX IF NOT EXISTS idx_notifications_profile ON notifications(profile_id);
+
+                CREATE TABLE IF NOT EXISTS source_watermarks (
+                    id                      TEXT PRIMARY KEY,
+                    profile_id              TEXT NOT NULL REFERENCES profiles(id),
+                    source_type             TEXT NOT NULL,
+                    source_scope_hash       TEXT NOT NULL,
+                    last_fetched_at         TEXT,
+                    last_item_published_at  TEXT,
+                    gap_skipped             INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(profile_id, source_type, source_scope_hash)
+                );
+                CREATE INDEX IF NOT EXISTS idx_watermarks_profile ON source_watermarks(profile_id);
+
+                CREATE TABLE IF NOT EXISTS item_aliases (
+                    id          TEXT PRIMARY KEY,
+                    item_id     TEXT NOT NULL,
+                    alias_type  TEXT NOT NULL,
+                    alias_value TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    created_at  TEXT NOT NULL,
+                    UNIQUE(alias_type, alias_value)
+                );
+                CREATE INDEX IF NOT EXISTS idx_aliases_item ON item_aliases(item_id);
+                CREATE INDEX IF NOT EXISTS idx_aliases_value ON item_aliases(alias_type, alias_value);
+
+                CREATE TABLE IF NOT EXISTS source_health (
+                    source_type          TEXT PRIMARY KEY,
+                    last_success_at      TEXT,
+                    last_error_at        TEXT,
+                    last_error_category  TEXT,
+                    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                    current_lag_seconds  INTEGER,
+                    last_gap_skipped_at  TEXT,
+                    rate_limit_until     TEXT
+                );
                 "#,
             )?;
             Ok(())
@@ -397,8 +446,9 @@ mod sqlite {
             let sources_json = serde_json::to_string(&profile.sources)?;
             self.conn.execute(
                 "INSERT INTO profiles (id, name, keywords, negative_keywords, sources, \
-                 scoring_prompt, score_threshold, max_llm_calls, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 scoring_prompt, score_threshold, max_llm_calls, revision, last_seen_at, \
+                 archived_at, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     profile.id,
                     profile.name,
@@ -408,6 +458,9 @@ mod sqlite {
                     profile.scoring_prompt,
                     profile.score_threshold,
                     profile.max_llm_calls,
+                    profile.revision,
+                    profile.last_seen_at.map(|dt| dt.to_rfc3339()),
+                    profile.archived_at.map(|dt| dt.to_rfc3339()),
                     profile.created_at.to_rfc3339(),
                 ],
             )?;
@@ -417,7 +470,8 @@ mod sqlite {
         pub fn get_profile(&self, id: &str) -> Result<Option<crate::Profile>> {
             let mut stmt = self.conn.prepare(
                 "SELECT id, name, keywords, negative_keywords, sources, scoring_prompt, \
-                 score_threshold, max_llm_calls, created_at FROM profiles WHERE id = ?1",
+                 score_threshold, max_llm_calls, revision, last_seen_at, archived_at, \
+                 created_at FROM profiles WHERE id = ?1",
             )?;
             let mut rows = stmt.query(params![id])?;
             if let Some(row) = rows.next()? {
@@ -433,7 +487,13 @@ mod sqlite {
             let keywords_str: String = row.get(2)?;
             let neg_keywords_str: String = row.get(3)?;
             let sources_str: String = row.get(4)?;
-            let created_str: String = row.get(8)?;
+            let last_seen_str: Option<String> = row.get(9)?;
+            let archived_str: Option<String> = row.get(10)?;
+            let created_str: String = row.get(11)?;
+            let parse_opt_dt = |s: Option<String>| -> Option<DateTime<Utc>> {
+                s.and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                    .map(|dt| dt.with_timezone(&Utc))
+            };
             let created_at = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
@@ -446,6 +506,9 @@ mod sqlite {
                 scoring_prompt: row.get(5)?,
                 score_threshold: row.get(6)?,
                 max_llm_calls: row.get(7)?,
+                revision: row.get::<_, i64>(8)? as u32,
+                last_seen_at: parse_opt_dt(last_seen_str),
+                archived_at: parse_opt_dt(archived_str),
                 created_at,
             })
         }
@@ -453,7 +516,8 @@ mod sqlite {
         pub fn list_profiles(&self) -> Result<Vec<crate::Profile>> {
             let mut stmt = self.conn.prepare(
                 "SELECT id, name, keywords, negative_keywords, sources, scoring_prompt, \
-                 score_threshold, max_llm_calls, created_at FROM profiles ORDER BY created_at DESC",
+                 score_threshold, max_llm_calls, revision, last_seen_at, archived_at, \
+                 created_at FROM profiles ORDER BY created_at DESC",
             )?;
             let mut profiles = Vec::new();
             let mut rows = stmt.query([])?;
@@ -469,7 +533,8 @@ mod sqlite {
             let sources_json = serde_json::to_string(&profile.sources)?;
             self.conn.execute(
                 "UPDATE profiles SET name = ?2, keywords = ?3, negative_keywords = ?4, \
-                 sources = ?5, scoring_prompt = ?6, score_threshold = ?7, max_llm_calls = ?8 \
+                 sources = ?5, scoring_prompt = ?6, score_threshold = ?7, max_llm_calls = ?8, \
+                 revision = revision + 1, last_seen_at = ?9, archived_at = ?10 \
                  WHERE id = ?1",
                 params![
                     profile.id,
@@ -480,6 +545,8 @@ mod sqlite {
                     profile.scoring_prompt,
                     profile.score_threshold,
                     profile.max_llm_calls,
+                    profile.last_seen_at.map(|dt| dt.to_rfc3339()),
+                    profile.archived_at.map(|dt| dt.to_rfc3339()),
                 ],
             )?;
             Ok(())
@@ -517,8 +584,11 @@ mod sqlite {
 
         pub fn insert_scan_job(&self, job: &crate::ScanJob) -> Result<String> {
             self.conn.execute(
-                "INSERT INTO scan_jobs (id, profile_id, status, progress, total, reason, created_at, completed_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO scan_jobs (id, profile_id, status, progress, total, reason, \
+                 claimed_by, lease_token, lease_expires_at, heartbeat_at, last_progress_at, \
+                 attempt_count, profile_revision_at_enqueue, llm_spend_microunits, \
+                 warnings_json, error_json, progress_json, created_at, completed_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
                 params![
                     job.id,
                     job.profile_id,
@@ -526,6 +596,17 @@ mod sqlite {
                     job.progress,
                     job.total,
                     job.reason,
+                    job.claimed_by,
+                    job.lease_token,
+                    job.lease_expires_at.map(|dt| dt.to_rfc3339()),
+                    job.heartbeat_at.map(|dt| dt.to_rfc3339()),
+                    job.last_progress_at.map(|dt| dt.to_rfc3339()),
+                    job.attempt_count,
+                    job.profile_revision_at_enqueue,
+                    job.llm_spend_microunits,
+                    job.warnings_json,
+                    job.error_json,
+                    job.progress_json,
                     job.created_at.to_rfc3339(),
                     job.completed_at.map(|dt| dt.to_rfc3339()),
                 ],
@@ -533,11 +614,15 @@ mod sqlite {
             Ok(job.id.clone())
         }
 
+        const SCAN_JOB_COLS: &'static str =
+            "id, profile_id, status, progress, total, reason, \
+             claimed_by, lease_token, lease_expires_at, heartbeat_at, last_progress_at, \
+             attempt_count, profile_revision_at_enqueue, llm_spend_microunits, \
+             warnings_json, error_json, progress_json, created_at, completed_at";
+
         pub fn get_scan_job(&self, id: &str) -> Result<Option<crate::ScanJob>> {
-            let mut stmt = self.conn.prepare(
-                "SELECT id, profile_id, status, progress, total, reason, created_at, completed_at \
-                 FROM scan_jobs WHERE id = ?1",
-            )?;
+            let sql = format!("SELECT {} FROM scan_jobs WHERE id = ?1", Self::SCAN_JOB_COLS);
+            let mut stmt = self.conn.prepare(&sql)?;
             let mut rows = stmt.query(params![id])?;
             if let Some(row) = rows.next()? {
                 Ok(Some(Self::row_to_scan_job(row)?))
@@ -546,18 +631,19 @@ mod sqlite {
             }
         }
 
+        fn parse_opt_dt(s: Option<String>) -> Option<DateTime<Utc>> {
+            s.and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                .map(|dt| dt.with_timezone(&Utc))
+        }
+
         fn row_to_scan_job(
             row: &rusqlite::Row,
         ) -> std::result::Result<crate::ScanJob, StorageError> {
             let status_str: String = row.get(2)?;
-            let created_str: String = row.get(6)?;
-            let completed_str: Option<String> = row.get(7)?;
+            let created_str: String = row.get(17)?;
             let created_at = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
-            let completed_at = completed_str
-                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                .map(|dt| dt.with_timezone(&Utc));
             Ok(crate::ScanJob {
                 id: row.get(0)?,
                 profile_id: row.get(1)?,
@@ -565,22 +651,83 @@ mod sqlite {
                 progress: row.get::<_, i64>(3)? as u32,
                 total: row.get::<_, i64>(4)? as u32,
                 reason: row.get(5)?,
+                claimed_by: row.get(6)?,
+                lease_token: row.get(7)?,
+                lease_expires_at: Self::parse_opt_dt(row.get(8)?),
+                heartbeat_at: Self::parse_opt_dt(row.get(9)?),
+                last_progress_at: Self::parse_opt_dt(row.get(10)?),
+                attempt_count: row.get::<_, i64>(11)? as u32,
+                profile_revision_at_enqueue: row.get::<_, Option<i64>>(12)?.map(|v| v as u32),
+                llm_spend_microunits: row.get(13)?,
+                warnings_json: row.get(14)?,
+                error_json: row.get(15)?,
+                progress_json: row.get(16)?,
                 created_at,
-                completed_at,
+                completed_at: Self::parse_opt_dt(row.get(18)?),
             })
         }
 
         pub fn claim_scan_job(&self, job_id: &str) -> Result<Option<crate::ScanJob>> {
-            if let Some(job) = self.get_scan_job(job_id)? {
-                if job.status == crate::ScanJobStatus::Pending {
-                    self.conn.execute(
-                        "UPDATE scan_jobs SET status = 'running' WHERE id = ?1 AND status = 'pending'",
-                        params![job_id],
-                    )?;
-                    return self.get_scan_job(job_id);
-                }
+            let now = Utc::now();
+            let lease_token = Uuid::new_v4().to_string();
+            let lease_expires = now + chrono::Duration::minutes(5);
+            // Atomic claim: only succeeds if pending OR if lease has expired
+            let updated = self.conn.execute(
+                "UPDATE scan_jobs SET status = 'running', \
+                 lease_token = ?2, lease_expires_at = ?3, heartbeat_at = ?4, \
+                 attempt_count = attempt_count + 1 \
+                 WHERE id = ?1 AND (status = 'pending' OR \
+                 (status = 'running' AND lease_expires_at < ?4))",
+                params![
+                    job_id,
+                    lease_token,
+                    lease_expires.to_rfc3339(),
+                    now.to_rfc3339(),
+                ],
+            )?;
+            if updated > 0 {
+                self.get_scan_job(job_id)
+            } else {
+                Ok(None)
             }
-            Ok(None)
+        }
+
+        /// Renew a job's lease. Returns Ok(true) if renewed, Ok(false) if token mismatch.
+        pub fn heartbeat_job(&self, job_id: &str, lease_token: &str) -> Result<bool> {
+            let now = Utc::now();
+            let lease_expires = now + chrono::Duration::minutes(5);
+            let updated = self.conn.execute(
+                "UPDATE scan_jobs SET heartbeat_at = ?3, lease_expires_at = ?4 \
+                 WHERE id = ?1 AND lease_token = ?2",
+                params![
+                    job_id,
+                    lease_token,
+                    now.to_rfc3339(),
+                    lease_expires.to_rfc3339(),
+                ],
+            )?;
+            Ok(updated > 0)
+        }
+
+        /// Complete a job only if the lease_token matches (fenced terminal write).
+        pub fn complete_job_fenced(
+            &self,
+            job_id: &str,
+            lease_token: &str,
+            status: crate::ScanJobStatus,
+        ) -> Result<bool> {
+            let now = Utc::now();
+            let updated = self.conn.execute(
+                "UPDATE scan_jobs SET status = ?3, completed_at = ?4 \
+                 WHERE id = ?1 AND lease_token = ?2",
+                params![
+                    job_id,
+                    lease_token,
+                    status.as_str(),
+                    now.to_rfc3339(),
+                ],
+            )?;
+            Ok(updated > 0)
         }
 
         pub fn fail_scan_job(&self, job_id: &str) -> Result<()> {
@@ -593,13 +740,21 @@ mod sqlite {
 
         pub fn update_scan_job(&self, job: &crate::ScanJob) -> Result<()> {
             self.conn.execute(
-                "UPDATE scan_jobs SET status = ?2, progress = ?3, total = ?4, completed_at = ?5 WHERE id = ?1",
+                "UPDATE scan_jobs SET status = ?2, progress = ?3, total = ?4, \
+                 llm_spend_microunits = ?5, warnings_json = ?6, error_json = ?7, \
+                 progress_json = ?8, completed_at = ?9, last_progress_at = ?10 \
+                 WHERE id = ?1",
                 params![
                     job.id,
                     job.status.as_str(),
                     job.progress,
                     job.total,
+                    job.llm_spend_microunits,
+                    job.warnings_json,
+                    job.error_json,
+                    job.progress_json,
                     job.completed_at.map(|dt| dt.to_rfc3339()),
+                    job.last_progress_at.map(|dt| dt.to_rfc3339()),
                 ],
             )?;
             Ok(())
@@ -610,10 +765,11 @@ mod sqlite {
             profile_id: &str,
             limit: usize,
         ) -> Result<Vec<crate::ScanJob>> {
-            let mut stmt = self.conn.prepare(
-                "SELECT id, profile_id, status, progress, total, reason, created_at, completed_at \
-                 FROM scan_jobs WHERE profile_id = ?1 ORDER BY created_at DESC LIMIT ?2",
-            )?;
+            let sql = format!(
+                "SELECT {} FROM scan_jobs WHERE profile_id = ?1 ORDER BY created_at DESC LIMIT ?2",
+                Self::SCAN_JOB_COLS
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
             let mut jobs = Vec::new();
             let mut rows = stmt.query(params![profile_id, limit as i64])?;
             while let Some(row) = rows.next()? {
@@ -623,11 +779,12 @@ mod sqlite {
         }
 
         pub fn get_active_scan_job(&self, profile_id: &str) -> Result<Option<crate::ScanJob>> {
-            let mut stmt = self.conn.prepare(
-                "SELECT id, profile_id, status, progress, total, reason, created_at, completed_at \
-                 FROM scan_jobs WHERE profile_id = ?1 AND status IN ('pending', 'running') \
+            let sql = format!(
+                "SELECT {} FROM scan_jobs WHERE profile_id = ?1 AND status IN ('pending', 'running') \
                  ORDER BY created_at DESC LIMIT 1",
-            )?;
+                Self::SCAN_JOB_COLS
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
             let mut rows = stmt.query(params![profile_id])?;
             if let Some(row) = rows.next()? {
                 Ok(Some(Self::row_to_scan_job(row)?))
@@ -637,10 +794,15 @@ mod sqlite {
         }
 
         pub fn claim_next_scan_job(&self) -> Result<Option<crate::ScanJob>> {
+            let now = Utc::now().to_rfc3339();
+            // Find pending jobs OR running jobs with expired leases
             let mut stmt = self.conn.prepare(
-                "SELECT id FROM scan_jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1",
+                "SELECT id FROM scan_jobs WHERE \
+                 status = 'pending' OR \
+                 (status = 'running' AND lease_expires_at < ?1) \
+                 ORDER BY created_at ASC LIMIT 1",
             )?;
-            let mut rows = stmt.query([])?;
+            let mut rows = stmt.query(params![now])?;
             if let Some(row) = rows.next()? {
                 let id: String = row.get(0)?;
                 drop(rows);
@@ -915,7 +1077,7 @@ mod sqlite {
         }
     }
 
-    /// Health status for a source.
+    /// Health status for a source (legacy — aggregate view).
     #[derive(Debug, Clone, serde::Serialize)]
     pub struct SourceHealth {
         pub source_type: String,
@@ -923,6 +1085,178 @@ mod sqlite {
         pub last_scan: Option<String>,
         pub items_count: u64,
         pub avg_relevance: f64,
+    }
+
+    /// Detailed source health from the source_health table.
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct SourceHealthDetail {
+        pub source_type: String,
+        pub last_success_at: Option<String>,
+        pub last_error_at: Option<String>,
+        pub last_error_category: Option<String>,
+        pub consecutive_failures: u32,
+        pub current_lag_seconds: Option<i64>,
+        pub last_gap_skipped_at: Option<String>,
+        pub rate_limit_until: Option<String>,
+    }
+
+    impl DbPool {
+        // ─── Watermarks ────────────────────────────────────────
+
+        pub fn upsert_watermark(&self, wm: &crate::SourceWatermark) -> Result<()> {
+            self.conn.execute(
+                "INSERT INTO source_watermarks \
+                 (id, profile_id, source_type, source_scope_hash, last_fetched_at, \
+                  last_item_published_at, gap_skipped) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(profile_id, source_type, source_scope_hash) DO UPDATE SET \
+                 last_fetched_at = excluded.last_fetched_at, \
+                 last_item_published_at = excluded.last_item_published_at, \
+                 gap_skipped = excluded.gap_skipped",
+                params![
+                    wm.id,
+                    wm.profile_id,
+                    wm.source_type,
+                    wm.source_scope_hash,
+                    wm.last_fetched_at.map(|dt| dt.to_rfc3339()),
+                    wm.last_item_published_at.map(|dt| dt.to_rfc3339()),
+                    wm.gap_skipped as i32,
+                ],
+            )?;
+            Ok(())
+        }
+
+        pub fn get_watermark(
+            &self,
+            profile_id: &str,
+            source_type: &str,
+            source_scope_hash: &str,
+        ) -> Result<Option<crate::SourceWatermark>> {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, profile_id, source_type, source_scope_hash, \
+                 last_fetched_at, last_item_published_at, gap_skipped \
+                 FROM source_watermarks \
+                 WHERE profile_id = ?1 AND source_type = ?2 AND source_scope_hash = ?3",
+            )?;
+            let mut rows = stmt.query(params![profile_id, source_type, source_scope_hash])?;
+            if let Some(row) = rows.next()? {
+                let last_fetched: Option<String> = row.get(4)?;
+                let last_published: Option<String> = row.get(5)?;
+                Ok(Some(crate::SourceWatermark {
+                    id: row.get(0)?,
+                    profile_id: row.get(1)?,
+                    source_type: row.get(2)?,
+                    source_scope_hash: row.get(3)?,
+                    last_fetched_at: Self::parse_opt_dt(last_fetched),
+                    last_item_published_at: Self::parse_opt_dt(last_published),
+                    gap_skipped: row.get::<_, i64>(6)? != 0,
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+
+        // ─── Item Aliases ──────────────────────────────────────
+
+        pub fn insert_alias(&self, alias: &crate::ItemAlias) -> Result<()> {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO item_aliases \
+                 (id, item_id, alias_type, alias_value, source_type, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    alias.id,
+                    alias.item_id,
+                    alias.alias_type,
+                    alias.alias_value,
+                    alias.source_type,
+                    alias.created_at.to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        }
+
+        /// Find an existing item by alias (hard-ID dedup).
+        pub fn find_by_alias(
+            &self,
+            alias_type: &str,
+            alias_value: &str,
+        ) -> Result<Option<String>> {
+            let mut stmt = self.conn.prepare(
+                "SELECT item_id FROM item_aliases \
+                 WHERE alias_type = ?1 AND alias_value = ?2",
+            )?;
+            let mut rows = stmt.query(params![alias_type, alias_value])?;
+            if let Some(row) = rows.next()? {
+                Ok(Some(row.get(0)?))
+            } else {
+                Ok(None)
+            }
+        }
+
+        // ─── Source Health ─────────────────────────────────────
+
+        pub fn upsert_source_health(
+            &self,
+            source_type: &str,
+            success: bool,
+            error_category: Option<&str>,
+        ) -> Result<()> {
+            let now = Utc::now().to_rfc3339();
+            if success {
+                self.conn.execute(
+                    "INSERT INTO source_health (source_type, last_success_at, consecutive_failures) \
+                     VALUES (?1, ?2, 0) \
+                     ON CONFLICT(source_type) DO UPDATE SET \
+                     last_success_at = excluded.last_success_at, consecutive_failures = 0",
+                    params![source_type, now],
+                )?;
+            } else {
+                self.conn.execute(
+                    "INSERT INTO source_health \
+                     (source_type, last_error_at, last_error_category, consecutive_failures) \
+                     VALUES (?1, ?2, ?3, 1) \
+                     ON CONFLICT(source_type) DO UPDATE SET \
+                     last_error_at = excluded.last_error_at, \
+                     last_error_category = excluded.last_error_category, \
+                     consecutive_failures = source_health.consecutive_failures + 1",
+                    params![source_type, now, error_category],
+                )?;
+            }
+            Ok(())
+        }
+
+        pub fn get_all_source_health(&self) -> Result<Vec<SourceHealthDetail>> {
+            let mut stmt = self.conn.prepare(
+                "SELECT source_type, last_success_at, last_error_at, last_error_category, \
+                 consecutive_failures, current_lag_seconds, last_gap_skipped_at, rate_limit_until \
+                 FROM source_health",
+            )?;
+            let mut results = Vec::new();
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                results.push(SourceHealthDetail {
+                    source_type: row.get(0)?,
+                    last_success_at: row.get(1)?,
+                    last_error_at: row.get(2)?,
+                    last_error_category: row.get(3)?,
+                    consecutive_failures: row.get::<_, i64>(4)? as u32,
+                    current_lag_seconds: row.get(5)?,
+                    last_gap_skipped_at: row.get(6)?,
+                    rate_limit_until: row.get(7)?,
+                });
+            }
+            Ok(results)
+        }
+
+        /// Archive a profile — sets archived_at and rejects new scans.
+        pub fn archive_profile(&self, profile_id: &str) -> Result<()> {
+            let now = Utc::now().to_rfc3339();
+            self.conn.execute(
+                "UPDATE profiles SET archived_at = ?2 WHERE id = ?1",
+                params![profile_id, now],
+            )?;
+            Ok(())
+        }
     }
 
     // ─── Tests ────────────────────────────────────────────────

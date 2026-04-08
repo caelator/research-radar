@@ -156,6 +156,9 @@ pub struct Profile {
     pub scoring_prompt: Option<String>,
     pub score_threshold: f64,
     pub max_llm_calls: u32,
+    pub revision: u32,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub archived_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -170,8 +173,15 @@ impl Profile {
             scoring_prompt: None,
             score_threshold: 0.5,
             max_llm_calls: 10,
+            revision: 1,
+            last_seen_at: None,
+            archived_at: None,
             created_at: Utc::now(),
         }
+    }
+
+    pub fn is_archived(&self) -> bool {
+        self.archived_at.is_some()
     }
 }
 
@@ -217,6 +227,17 @@ pub struct ScanJob {
     pub progress: u32,
     pub total: u32,
     pub reason: Option<String>,
+    pub claimed_by: Option<String>,
+    pub lease_token: Option<String>,
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    pub heartbeat_at: Option<DateTime<Utc>>,
+    pub last_progress_at: Option<DateTime<Utc>>,
+    pub attempt_count: u32,
+    pub profile_revision_at_enqueue: Option<u32>,
+    pub llm_spend_microunits: i64,
+    pub warnings_json: Option<String>,
+    pub error_json: Option<String>,
+    pub progress_json: Option<String>,
     pub created_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
 }
@@ -230,6 +251,17 @@ impl ScanJob {
             progress: 0,
             total: 0,
             reason,
+            claimed_by: None,
+            lease_token: None,
+            lease_expires_at: None,
+            heartbeat_at: None,
+            last_progress_at: None,
+            attempt_count: 0,
+            profile_revision_at_enqueue: None,
+            llm_spend_microunits: 0,
+            warnings_json: None,
+            error_json: None,
+            progress_json: None,
             created_at: Utc::now(),
             completed_at: None,
         }
@@ -276,6 +308,65 @@ pub struct ScoredMatch {
     pub disposition: String,
 }
 
+// ─── SourceWatermark ─────────────────────────────────────────────────
+
+/// Per-profile, per-source watermark for incremental fetching.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceWatermark {
+    pub id: String,
+    pub profile_id: String,
+    pub source_type: String,
+    pub source_scope_hash: String,
+    pub last_fetched_at: Option<DateTime<Utc>>,
+    pub last_item_published_at: Option<DateTime<Utc>>,
+    pub gap_skipped: bool,
+}
+
+impl SourceWatermark {
+    pub fn new(profile_id: String, source_type: String, source_scope_hash: String) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            profile_id,
+            source_type,
+            source_scope_hash,
+            last_fetched_at: None,
+            last_item_published_at: None,
+            gap_skipped: false,
+        }
+    }
+}
+
+// ─── ItemAlias ──────────────────────────────────────────────────────
+
+/// Hard-ID alias for cross-source deduplication.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ItemAlias {
+    pub id: String,
+    pub item_id: String,
+    pub alias_type: String,
+    pub alias_value: String,
+    pub source_type: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl ItemAlias {
+    pub fn new(
+        item_id: String,
+        alias_type: String,
+        alias_value: String,
+        source_type: String,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            item_id,
+            alias_type,
+            alias_value,
+            source_type,
+            created_at: Utc::now(),
+        }
+    }
+}
+
 // ─── Re-exports ──────────────────────────────────────────────────────
 
 pub mod arxiv;
@@ -292,6 +383,6 @@ pub use finding::{Finding, PaperRef, UrgencyLevel};
 pub use score::score_entry;
 pub use scorer::{AnthropicBackend, LlmBackend, MockBackend, ScorerResult};
 pub use storage::lance_store::Result as LanceResult;
-pub use storage::{DbPool, RadarStore, SourceHealth};
+pub use storage::{DbPool, RadarStore, SourceHealth, SourceHealthDetail};
 // Re-export the sqlite StorageError directly so executor can use std::result::Result<T, StorageError>
 pub use crate::storage::StorageError;
