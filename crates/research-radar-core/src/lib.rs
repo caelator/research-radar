@@ -376,6 +376,7 @@ pub mod finding;
 pub mod notify;
 pub mod score;
 pub mod scorer;
+pub mod semantic_scholar;
 pub mod storage;
 
 pub use executor::{PipelineExecutor, PipelineRun};

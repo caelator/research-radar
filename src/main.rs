@@ -325,8 +325,9 @@ fn main() {
                     }
                 }
 
-                // Process all pending jobs
+                // Process all pending jobs — continue on individual failures
                 let mut total_runs = 0;
+                let mut failures = 0;
                 loop {
                     match executor.run_next(&pool) {
                         Ok(Some(run)) => {
@@ -335,8 +336,13 @@ fn main() {
                         }
                         Ok(None) => break,
                         Err(e) => {
-                            eprintln!("error: scan job failed: {e}");
-                            break;
+                            eprintln!("warning: scan job failed: {e}");
+                            failures += 1;
+                            // Continue to next job instead of stopping
+                            if failures >= 5 {
+                                eprintln!("error: too many consecutive failures, stopping");
+                                break;
+                            }
                         }
                     }
                 }

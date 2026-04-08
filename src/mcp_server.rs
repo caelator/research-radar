@@ -168,13 +168,15 @@ fn spawn_scan_worker(shutdown: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
         while !shutdown.load(Ordering::Relaxed) {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-            // Process all available jobs in one burst
+            // Process all available jobs in one burst — continue on individual failures
+            let mut consecutive_failures = 0u32;
             loop {
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
                 match executor.run_next(&pool) {
                     Ok(Some(run)) => {
+                        consecutive_failures = 0;
                         tracing::info!(
                             "scan worker: completed job {} for profile {} — {} accepted",
                             run.job_id,
@@ -184,8 +186,13 @@ fn spawn_scan_worker(shutdown: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
                     }
                     Ok(None) => break, // no more pending jobs
                     Err(e) => {
-                        tracing::warn!("scan worker: job failed: {e}");
-                        break;
+                        consecutive_failures += 1;
+                        tracing::warn!("scan worker: job failed ({consecutive_failures}): {e}");
+                        if consecutive_failures >= 5 {
+                            tracing::error!("scan worker: too many consecutive failures, backing off");
+                            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                            break;
+                        }
                     }
                 }
             }

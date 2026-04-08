@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::arxiv;
 use crate::notify;
 use crate::scorer::{LlmBackend, MockBackend, ScorerResult};
+use crate::semantic_scholar;
 use crate::{
     score_entry, DbPool, Entry, Finding, Profile, RadarStore, ScanJobStatus, ScoredMatch,
     StorageError, UrgencyLevel,
@@ -35,6 +36,7 @@ pub struct PipelineRun {
     pub accepted: usize,
     pub notified: usize,
     pub arxiv_fetched: usize,
+    pub s2_fetched: usize,
 }
 
 pub struct PipelineExecutor {
@@ -128,8 +130,11 @@ impl PipelineExecutor {
             });
         }
 
-        // Stage 1: Fetch from arXiv (if keywords present)
+        // Stage 1a: Fetch from arXiv (if keywords present)
         let arxiv_fetched = self.fetch_arxiv(pool, &profile);
+
+        // Stage 1b: Fetch from Semantic Scholar
+        let s2_fetched = self.fetch_s2(pool, &profile);
 
         // Stage 2: Gather candidates
         let mut candidates = self.fetch_candidates(pool, &profile)?;
@@ -179,14 +184,37 @@ impl PipelineExecutor {
             accepted,
             notified,
             arxiv_fetched,
+            s2_fetched,
         })
     }
 
     /// Fetch papers from arXiv and insert as sources + entries.
+    ///
+    /// Uses alias-based dedup (arxiv_id) instead of fragile text search,
+    /// and updates watermarks for incremental fetching.
     fn fetch_arxiv(&self, pool: &DbPool, profile: &Profile) -> usize {
+        use crate::{ItemAlias, SourceWatermark};
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
         if profile.keywords.is_empty() {
             return 0;
         }
+
+        // Compute a stable scope hash from the profile's sorted keywords
+        let scope_hash = {
+            let mut sorted = profile.keywords.clone();
+            sorted.sort();
+            let mut h = DefaultHasher::new();
+            sorted.hash(&mut h);
+            format!("{:016x}", h.finish())
+        };
+
+        // Load watermark for this profile+arxiv+scope
+        let watermark = pool
+            .get_watermark(&profile.id, "arxiv", &scope_hash)
+            .ok()
+            .flatten();
 
         let papers = match tokio_block_on(arxiv::fetch_arxiv_papers(profile, 20)) {
             Ok(papers) => {
@@ -201,17 +229,68 @@ impl PipelineExecutor {
         };
 
         let mut inserted = 0;
+        let mut newest_published: Option<chrono::DateTime<chrono::Utc>> = None;
+
         for paper in &papers {
-            // Check if source URL already exists to avoid duplicates
-            let existing = pool.search_entries(&paper.arxiv_id, 1).unwrap_or_default();
-            if !existing.is_empty() {
+            // Skip papers older than watermark (incremental fetch)
+            if let Some(ref wm) = watermark {
+                if let Some(last_pub) = wm.last_item_published_at {
+                    if paper.published <= last_pub {
+                        continue;
+                    }
+                }
+            }
+
+            // Alias-based dedup: check if this arxiv_id was already ingested
+            if let Ok(Some(_)) = pool.find_by_alias("arxiv_id", &paper.arxiv_id) {
                 continue;
             }
 
             let (source, entry) = arxiv::paper_to_source_entry(paper);
             if pool.insert_source(&source).is_ok() && pool.insert_entry(&entry).is_ok() {
+                // Register the arxiv_id alias for future dedup
+                let alias = ItemAlias::new(
+                    entry.id.clone(),
+                    "arxiv_id".into(),
+                    paper.arxiv_id.clone(),
+                    "arxiv".into(),
+                );
+                let _ = pool.insert_alias(&alias);
                 inserted += 1;
+
+                // Track the newest paper we inserted
+                match newest_published {
+                    Some(cur) if paper.published > cur => {
+                        newest_published = Some(paper.published);
+                    }
+                    None => {
+                        newest_published = Some(paper.published);
+                    }
+                    _ => {}
+                }
             }
+        }
+
+        // Update watermark with the latest published date
+        if let Some(newest) = newest_published {
+            let mut wm = watermark.unwrap_or_else(|| {
+                SourceWatermark::new(profile.id.clone(), "arxiv".into(), scope_hash.clone())
+            });
+            wm.last_fetched_at = Some(Utc::now());
+            // Only advance the watermark forward
+            let should_advance = wm
+                .last_item_published_at
+                .map_or(true, |prev| newest > prev);
+            if should_advance {
+                wm.last_item_published_at = Some(newest);
+            }
+            let _ = pool.upsert_watermark(&wm);
+        } else if watermark.is_none() && !papers.is_empty() {
+            // First run, no new inserts but papers exist — record fetch time
+            let mut wm =
+                SourceWatermark::new(profile.id.clone(), "arxiv".into(), scope_hash.clone());
+            wm.last_fetched_at = Some(Utc::now());
+            let _ = pool.upsert_watermark(&wm);
         }
 
         if inserted > 0 {
