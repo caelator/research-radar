@@ -93,6 +93,7 @@ struct OaSource {
 
 #[derive(Debug, Deserialize)]
 struct OaIds {
+    #[allow(dead_code)]
     openalex: Option<String>,
     doi: Option<String>,
 }
