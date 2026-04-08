@@ -710,6 +710,7 @@ mod sqlite {
         }
 
         /// Complete a job only if the lease_token matches (fenced terminal write).
+        /// Also updates progress and total from the provided job.
         pub fn complete_job_fenced(
             &self,
             job_id: &str,
@@ -725,6 +726,30 @@ mod sqlite {
                     lease_token,
                     status.as_str(),
                     now.to_rfc3339(),
+                ],
+            )?;
+            Ok(updated > 0)
+        }
+
+        /// Complete a job with full state update, fenced on lease_token.
+        pub fn complete_job_fenced_full(
+            &self,
+            job: &crate::ScanJob,
+            lease_token: &str,
+        ) -> Result<bool> {
+            let now = Utc::now();
+            let updated = self.conn.execute(
+                "UPDATE scan_jobs SET status = ?3, completed_at = ?4, \
+                 progress = ?5, total = ?6, llm_spend_microunits = ?7 \
+                 WHERE id = ?1 AND lease_token = ?2",
+                params![
+                    job.id,
+                    lease_token,
+                    job.status.as_str(),
+                    now.to_rfc3339(),
+                    job.progress,
+                    job.total,
+                    job.llm_spend_microunits,
                 ],
             )?;
             Ok(updated > 0)

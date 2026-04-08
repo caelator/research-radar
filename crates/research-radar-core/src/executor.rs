@@ -109,6 +109,25 @@ impl PipelineExecutor {
             StorageError::NotFound(format!("profile {} not found", job.profile_id))
         })?;
 
+        // Guard: reject archived profiles
+        if profile.is_archived() {
+            tracing::warn!(
+                "profile '{}' is archived — aborting scan job {}",
+                profile.name,
+                job.id
+            );
+            if let Some(ref token) = job.lease_token {
+                pool.complete_job_fenced(&job.id, token, ScanJobStatus::Failed)?;
+            } else {
+                pool.fail_scan_job(&job.id)?;
+            }
+            return Ok(PipelineRun {
+                job_id: job.id.clone(),
+                profile_id: profile.id,
+                ..Default::default()
+            });
+        }
+
         // Stage 1: Fetch from arXiv (if keywords present)
         let arxiv_fetched = self.fetch_arxiv(pool, &profile);
 
@@ -134,12 +153,22 @@ impl PipelineExecutor {
         // Stage 8: Notify
         let notified = self.notify(pool, &profile, &ranked);
 
-        // Mark job complete
+        // Mark job complete — use fenced write if lease is available
         job.total = ranked.len() as u32;
         job.progress = ranked.len() as u32;
         job.status = ScanJobStatus::Complete;
         job.completed_at = Some(Utc::now());
-        pool.update_scan_job(job)?;
+        if let Some(ref token) = job.lease_token.clone() {
+            let fenced = pool.complete_job_fenced_full(job, token)?;
+            if !fenced {
+                tracing::warn!(
+                    "lease lost for job {} — another worker may have taken over",
+                    job.id
+                );
+            }
+        } else {
+            pool.update_scan_job(job)?;
+        }
 
         Ok(PipelineRun {
             job_id: job.id.clone(),
@@ -160,9 +189,13 @@ impl PipelineExecutor {
         }
 
         let papers = match tokio_block_on(arxiv::fetch_arxiv_papers(profile, 20)) {
-            Ok(papers) => papers,
+            Ok(papers) => {
+                let _ = pool.upsert_source_health("arxiv", true, None);
+                papers
+            }
             Err(e) => {
                 tracing::warn!("arXiv fetch failed: {e}");
+                let _ = pool.upsert_source_health("arxiv", false, Some(&e.to_string()));
                 return 0;
             }
         };
