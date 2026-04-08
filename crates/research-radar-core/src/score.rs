@@ -65,6 +65,9 @@ mod tests {
             scoring_prompt: None,
             score_threshold: 0.5,
             max_llm_calls: 10,
+            revision: 1,
+            last_seen_at: None,
+            archived_at: None,
             created_at: chrono::Utc::now(),
         }
     }
