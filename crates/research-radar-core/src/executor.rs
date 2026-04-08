@@ -42,11 +42,26 @@ pub struct PipelineRun {
 pub struct PipelineExecutor {
     scorer: Arc<dyn LlmBackend>,
     discord_webhook_url: Option<String>,
+    /// If true, skips external API calls (arXiv, Semantic Scholar) in tests.
+    #[cfg(test)]
+    disable_external_fetches: bool,
 }
 
 impl Default for PipelineExecutor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+impl PipelineExecutor {
+    /// Create an executor for tests that should not make external API calls.
+    fn test_executor() -> Self {
+        Self {
+            scorer: Arc::new(MockBackend),
+            discord_webhook_url: None,
+            disable_external_fetches: true,
+        }
     }
 }
 
@@ -62,6 +77,8 @@ impl PipelineExecutor {
         Self {
             scorer,
             discord_webhook_url: None,
+            #[cfg(test)]
+            disable_external_fetches: false,
         }
     }
 
@@ -201,6 +218,11 @@ impl PipelineExecutor {
             return 0;
         }
 
+        #[cfg(test)]
+        if self.disable_external_fetches {
+            return 0;
+        }
+
         // Compute a stable scope hash from the profile's sorted keywords
         let scope_hash = {
             let mut sorted = profile.keywords.clone();
@@ -312,6 +334,11 @@ impl PipelineExecutor {
         use std::hash::{Hash, Hasher};
 
         if profile.keywords.is_empty() {
+            return 0;
+        }
+
+        #[cfg(test)]
+        if self.disable_external_fetches {
             return 0;
         }
 
@@ -704,9 +731,9 @@ mod tests {
         pool.insert_entry(&entry).unwrap();
 
         let job = pool.enqueue_job(&profile.id, Some("test".into())).unwrap();
-        let run = PipelineExecutor::new().run_next(&pool).unwrap().unwrap();
+        let run = Self::test_executor().run_next(&pool).unwrap().unwrap();
         assert_eq!(run.job_id, job.id);
-        // arXiv may contribute additional matches
+        // The manually-added entry should be accepted
         assert!(run.accepted >= 1);
 
         let stored = pool.get_scan_job(&job.id).unwrap().unwrap();
@@ -728,10 +755,10 @@ mod tests {
         pool.insert_source(&source).unwrap();
         let job = pool.enqueue_job(&profile.id, None).unwrap();
 
-        let run = PipelineExecutor::new()
+        let run = Self::test_executor()
             .execute_job_by_id(&pool, &job.id)
             .unwrap();
-        // At least the manually-added source; arXiv may add more
+        // At least the manually-added source created an entry
         assert!(run.candidates >= 1);
         assert!(run.scored >= 1);
 
@@ -756,7 +783,7 @@ mod tests {
         let entry = Entry::new(source.id.clone(), "AI safety alignment research".into());
         pool.insert_entry(&entry).unwrap();
 
-        let executor = PipelineExecutor::with_scorer(Arc::new(MockBackend));
+        let executor = Self::test_executor();
         let job = pool.enqueue_job(&profile.id, None).unwrap();
         let run = executor.execute_job_by_id(&pool, &job.id).unwrap();
         assert!(run.accepted > 0);
