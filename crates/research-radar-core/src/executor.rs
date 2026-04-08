@@ -159,12 +159,22 @@ impl PipelineExecutor {
             });
         }
 
-        // Stage 1a: Fetch from arXiv (if keywords present)
-        let arxiv_fetched = self.fetch_arxiv(pool, &profile);
+        // Stage 1a: Fetch from arXiv (if keywords present, source not circuit-broken)
+        let arxiv_fetched = if pool.is_source_circuit_broken("arxiv") {
+            tracing::info!("arXiv circuit breaker open — skipping fetch for '{}'", profile.name);
+            0
+        } else {
+            self.fetch_arxiv(pool, &profile)
+        };
         self.heartbeat(pool, job);
 
-        // Stage 1b: Fetch from Semantic Scholar
-        let s2_fetched = self.fetch_s2(pool, &profile);
+        // Stage 1b: Fetch from Semantic Scholar (if not circuit-broken)
+        let s2_fetched = if pool.is_source_circuit_broken("semantic_scholar") {
+            tracing::info!("Semantic Scholar circuit breaker open — skipping fetch for '{}'", profile.name);
+            0
+        } else {
+            self.fetch_s2(pool, &profile)
+        };
         self.heartbeat(pool, job);
 
         // Stage 2: Gather candidates
@@ -261,8 +271,15 @@ impl PipelineExecutor {
                 papers
             }
             Err(e) => {
-                tracing::warn!("arXiv fetch failed: {e}");
-                let _ = pool.upsert_source_health("arxiv", false, Some(&e.to_string()));
+                let err_str = e.to_string();
+                tracing::warn!("arXiv fetch failed: {err_str}");
+                let _ = pool.upsert_source_health("arxiv", false, Some(&err_str));
+                // Set rate limit backoff if we detect a rate-limit response
+                if err_str.contains("429") || err_str.to_lowercase().contains("rate limit") {
+                    let backoff = chrono::Utc::now() + chrono::Duration::minutes(10);
+                    let _ = pool.set_rate_limit_until("arxiv", backoff);
+                    tracing::warn!("arXiv rate-limited — backoff until {backoff}");
+                }
                 return 0;
             }
         };
@@ -378,9 +395,14 @@ impl PipelineExecutor {
                 papers
             }
             Err(e) => {
-                tracing::warn!("Semantic Scholar fetch failed: {e}");
-                let _ =
-                    pool.upsert_source_health("semantic_scholar", false, Some(&e.to_string()));
+                let err_str = e.to_string();
+                tracing::warn!("Semantic Scholar fetch failed: {err_str}");
+                let _ = pool.upsert_source_health("semantic_scholar", false, Some(&err_str));
+                if err_str.contains("429") || err_str.to_lowercase().contains("rate limit") {
+                    let backoff = chrono::Utc::now() + chrono::Duration::minutes(10);
+                    let _ = pool.set_rate_limit_until("semantic_scholar", backoff);
+                    tracing::warn!("Semantic Scholar rate-limited — backoff until {backoff}");
+                }
                 return 0;
             }
         };

@@ -5,8 +5,8 @@
 //! queue and processes jobs asynchronously so `scan_poll` tracks real progress.
 
 use research_radar_core::{
-    AnthropicBackend, DbPool, PipelineExecutor, Profile, ScanJobStatus, ScoredMatch, SourceHealth,
-    Subscription,
+    AnthropicBackend, DbPool, PipelineExecutor, Profile, RadarStore, ScanJobStatus, ScoredMatch,
+    SourceHealth, Subscription, UrgencyLevel,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -220,6 +220,16 @@ pub struct ScanHistoryInput {
     pub limit: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct FindingsListInput {
+    #[serde(default)]
+    pub actionable_only: Option<bool>,
+    #[serde(default)]
+    pub urgency: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
 // ─── Background scan worker ────────────────────────────────────────
 
 /// Spawn a background Tokio task that polls for pending scan jobs and
@@ -275,6 +285,16 @@ fn spawn_scan_worker(
                         );
                         if let Ok(mut h) = health.lock() {
                             h.jobs_dead_lettered += dead_lettered as u64;
+                        }
+                        // Alert via Discord if webhook is configured
+                        if let Ok(url) = std::env::var("DISCORD_WEBHOOK_URL") {
+                            if !url.is_empty() {
+                                let msg = format!(
+                                    "**research-radar**: dead-lettered {dead_lettered} scan job(s) \
+                                     (exceeded max attempts). Check `worker_health` for details."
+                                );
+                                let _ = send_discord_alert(&url, &msg).await;
+                            }
                         }
                     }
                 }
@@ -348,10 +368,15 @@ fn spawn_scan_worker(
                         }
                         tracing::warn!("scan worker: job failed ({consecutive_failures}): {e}");
                         if consecutive_failures >= 5 {
-                            tracing::error!(
-                                "scan worker: too many consecutive failures, backing off"
+                            // Exponential backoff: 30s, 60s, 120s, ... capped at 5min
+                            let backoff_secs = std::cmp::min(
+                                30u64 * 2u64.saturating_pow(consecutive_failures.saturating_sub(5)),
+                                300,
                             );
-                            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                            tracing::error!(
+                                "scan worker: too many consecutive failures, backing off {backoff_secs}s"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
                             break;
                         }
                     }
@@ -371,6 +396,23 @@ fn spawn_scan_worker(
         }
         tracing::info!("scan worker shutting down");
     })
+}
+
+/// Send a plain-text alert to a Discord webhook. Best-effort, never panics.
+async fn send_discord_alert(webhook_url: &str, message: &str) {
+    let client = reqwest::Client::new();
+    let payload = serde_json::json!({ "content": message });
+    match client.post(webhook_url).json(&payload).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            tracing::info!("Discord alert sent");
+        }
+        Ok(resp) => {
+            tracing::warn!("Discord alert failed: {}", resp.status());
+        }
+        Err(e) => {
+            tracing::warn!("Discord alert error: {e}");
+        }
+    }
 }
 
 fn build_executor() -> PipelineExecutor {
@@ -473,6 +515,7 @@ fn handle_request(
         "match_get" => handle_match_get(pool, req.params),
         "subscription_set" => handle_subscription_set(pool, req.params),
         "source_health" => handle_source_health(pool, req.params),
+        "findings_list" => handle_findings_list(req.params),
         "worker_health" => handle_worker_health(worker_health),
         _ => {
             return JsonRpcResponse::error(id, -32601, "Method not found");
@@ -716,6 +759,55 @@ fn handle_worker_health(worker_health: &Arc<Mutex<WorkerHealth>>) -> Result<Valu
         .map_err(|e| format!("health lock poisoned: {e}"))?
         .snapshot();
     serde_json::to_value(&snapshot).map_err(|e| e.to_string())
+}
+
+fn handle_findings_list(params: Option<Value>) -> Result<Value, String> {
+    let input: FindingsListInput = serde_json::from_value(params.unwrap_or(Value::Null))
+        .map_err(|e| format!("Invalid params: {e}"))?;
+
+    let limit = input.limit.unwrap_or(20).min(100) as usize;
+
+    // Open LanceDB (async via block_in_place)
+    let store = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(RadarStore::init())
+    })
+    .map_err(|e| format!("LanceDB init failed: {e}"))?;
+
+    let findings = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            if input.actionable_only == Some(true) {
+                store.list_actionable_findings(limit).await
+            } else if let Some(ref urgency_str) = input.urgency {
+                let urgency = UrgencyLevel::from_str(urgency_str);
+                store.list_findings_by_urgency(urgency, limit).await
+            } else {
+                store.list_findings(limit).await
+            }
+        })
+    })
+    .map_err(|e| format!("LanceDB query failed: {e}"))?;
+
+    let items: Vec<Value> = findings
+        .into_iter()
+        .map(|f| {
+            serde_json::json!({
+                "id": f.id,
+                "title": f.title,
+                "summary": f.summary,
+                "domain": f.domain,
+                "confidence": f.confidence,
+                "impact_weight": f.impact_weight,
+                "urgency": f.urgency.as_str(),
+                "priority_score": f.priority_score(),
+                "is_actionable": f.is_actionable(),
+                "suggested_action": f.suggested_action,
+                "source_url": f.source_url,
+                "discovered_at": f.discovered_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({ "findings": items, "count": items.len() }))
 }
 
 fn handle_profile_list(pool: &DbPool) -> Result<Value, String> {

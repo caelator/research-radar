@@ -1257,6 +1257,53 @@ mod sqlite {
             Ok(())
         }
 
+        /// Circuit breaker check: returns true if a source should be skipped.
+        ///
+        /// A source is circuit-broken if:
+        /// - consecutive_failures >= threshold (default 3), OR
+        /// - rate_limit_until is in the future.
+        pub fn is_source_circuit_broken(&self, source_type: &str) -> bool {
+            const CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
+            let mut stmt = match self.conn.prepare(
+                "SELECT consecutive_failures, rate_limit_until FROM source_health \
+                 WHERE source_type = ?1",
+            ) {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            let mut rows = match stmt.query(params![source_type]) {
+                Ok(r) => r,
+                Err(_) => return false,
+            };
+            if let Ok(Some(row)) = rows.next() {
+                let failures: i64 = row.get(0).unwrap_or(0);
+                if failures as u32 >= CIRCUIT_BREAKER_THRESHOLD {
+                    return true;
+                }
+                if let Ok(Some(until_str)) = row.get::<_, Option<String>>(1) {
+                    if let Ok(until) = chrono::DateTime::parse_from_rfc3339(&until_str) {
+                        if until > Utc::now() {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+
+        /// Set rate_limit_until for a source (e.g. after receiving a 429).
+        pub fn set_rate_limit_until(
+            &self,
+            source_type: &str,
+            until: chrono::DateTime<Utc>,
+        ) -> Result<()> {
+            self.conn.execute(
+                "UPDATE source_health SET rate_limit_until = ?1 WHERE source_type = ?2",
+                params![until.to_rfc3339(), source_type],
+            )?;
+            Ok(())
+        }
+
         pub fn get_all_source_health(&self) -> Result<Vec<SourceHealthDetail>> {
             let mut stmt = self.conn.prepare(
                 "SELECT source_type, last_success_at, last_error_at, last_error_category, \
