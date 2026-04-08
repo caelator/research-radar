@@ -1273,6 +1273,35 @@ mod sqlite {
             Ok(results)
         }
 
+        /// Reclaim jobs whose leases have expired — reset them to pending so
+        /// they can be picked up by another worker.  Returns the number of
+        /// jobs reclaimed.
+        pub fn reclaim_expired_leases(&self) -> Result<usize> {
+            let now = Utc::now().to_rfc3339();
+            let updated = self.conn.execute(
+                "UPDATE scan_jobs SET status = 'pending', lease_token = NULL, \
+                 lease_expires_at = NULL, claimed_by = NULL \
+                 WHERE status = 'running' AND lease_expires_at < ?1",
+                params![now],
+            )?;
+            Ok(updated)
+        }
+
+        /// List recent scan jobs across all profiles, ordered newest-first.
+        pub fn list_recent_scan_jobs(&self, limit: usize) -> Result<Vec<crate::ScanJob>> {
+            let sql = format!(
+                "SELECT {} FROM scan_jobs ORDER BY created_at DESC LIMIT ?1",
+                Self::SCAN_JOB_COLS
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut jobs = Vec::new();
+            let mut rows = stmt.query(params![limit as i64])?;
+            while let Some(row) = rows.next()? {
+                jobs.push(Self::row_to_scan_job(row)?);
+            }
+            Ok(jobs)
+        }
+
         /// Archive a profile — sets archived_at and rejects new scans.
         pub fn archive_profile(&self, profile_id: &str) -> Result<()> {
             let now = Utc::now().to_rfc3339();
@@ -1434,6 +1463,50 @@ mod sqlite {
                 .unwrap();
             assert_eq!(matches.len(), 1);
             assert_eq!(matches[0].score, 0.85);
+        }
+
+        #[test]
+        fn reclaim_expired_leases_resets_stale_jobs() {
+            let pool = memory_pool();
+            let profile = Profile::new("Test".into(), vec!["test".into()]);
+            pool.insert_profile(&profile).unwrap();
+            let job = ScanJob::new(profile.id.clone(), None);
+            pool.insert_scan_job(&job).unwrap();
+
+            // Claim the job (sets lease)
+            let claimed = pool.claim_scan_job(&job.id).unwrap().unwrap();
+            assert_eq!(claimed.status, ScanJobStatus::Running);
+
+            // Manually expire the lease
+            pool.conn
+                .execute(
+                    "UPDATE scan_jobs SET lease_expires_at = '2020-01-01T00:00:00Z' WHERE id = ?1",
+                    params![job.id],
+                )
+                .unwrap();
+
+            // Reclaim should find and reset it
+            let reclaimed = pool.reclaim_expired_leases().unwrap();
+            assert_eq!(reclaimed, 1);
+
+            let after = pool.get_scan_job(&job.id).unwrap().unwrap();
+            assert_eq!(after.status, ScanJobStatus::Pending);
+            assert!(after.lease_token.is_none());
+        }
+
+        #[test]
+        fn list_recent_scan_jobs_across_profiles() {
+            let pool = memory_pool();
+            let p1 = Profile::new("A".into(), vec!["a".into()]);
+            let p2 = Profile::new("B".into(), vec!["b".into()]);
+            pool.insert_profile(&p1).unwrap();
+            pool.insert_profile(&p2).unwrap();
+
+            pool.enqueue_job(&p1.id, None).unwrap();
+            pool.enqueue_job(&p2.id, None).unwrap();
+
+            let jobs = pool.list_recent_scan_jobs(10).unwrap();
+            assert_eq!(jobs.len(), 2);
         }
     }
 }

@@ -145,6 +145,24 @@ pub struct SourceHealthInput {
     pub source_type: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ProfileGetInput {
+    pub profile_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProfileDeleteInput {
+    pub profile_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ScanHistoryInput {
+    #[serde(default)]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
 // ─── Background scan worker ────────────────────────────────────────
 
 /// Spawn a background Tokio task that polls for pending scan jobs and
@@ -152,6 +170,14 @@ pub struct SourceHealthInput {
 ///
 /// Opens its own DbPool so the main stdio thread retains exclusive
 /// ownership of its connection.
+/// Default interval between poll cycles (seconds).
+const WORKER_POLL_INTERVAL_SECS: u64 = 300;
+
+/// Interval between auto-enqueue cycles (seconds).
+/// We auto-enqueue less frequently than we poll so burst processing
+/// doesn't re-enqueue while jobs are still pending.
+const WORKER_ENQUEUE_INTERVAL_SECS: u64 = 600;
+
 fn spawn_scan_worker(shutdown: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Open a dedicated DB connection for the worker
@@ -165,10 +191,58 @@ fn spawn_scan_worker(shutdown: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
         let executor = build_executor();
 
         tracing::info!("scan worker started");
+
+        let mut last_enqueue = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(WORKER_ENQUEUE_INTERVAL_SECS))
+            .unwrap_or_else(std::time::Instant::now);
+
         while !shutdown.load(Ordering::Relaxed) {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-            // Process all available jobs in one burst — continue on individual failures
+            // ── Reclaim expired leases ─────────────────────────
+            match pool.reclaim_expired_leases() {
+                Ok(n) if n > 0 => {
+                    tracing::info!("scan worker: reclaimed {n} expired lease(s)");
+                }
+                Err(e) => {
+                    tracing::warn!("scan worker: lease reclamation failed: {e}");
+                }
+                _ => {}
+            }
+
+            // ── Auto-enqueue all active profiles periodically ──
+            if last_enqueue.elapsed()
+                >= std::time::Duration::from_secs(WORKER_ENQUEUE_INTERVAL_SECS)
+            {
+                last_enqueue = std::time::Instant::now();
+                match pool.list_profiles() {
+                    Ok(profiles) => {
+                        let active: Vec<_> =
+                            profiles.into_iter().filter(|p| !p.is_archived()).collect();
+                        for profile in &active {
+                            if let Err(e) =
+                                pool.enqueue_job(&profile.id, Some("auto-enqueue".into()))
+                            {
+                                tracing::warn!(
+                                    "scan worker: failed to enqueue for '{}': {e}",
+                                    profile.name
+                                );
+                            }
+                        }
+                        if !active.is_empty() {
+                            tracing::info!(
+                                "scan worker: auto-enqueued for {} active profile(s)",
+                                active.len()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("scan worker: failed to list profiles: {e}");
+                    }
+                }
+            }
+
+            // ── Process all available jobs in one burst ─────────
             let mut consecutive_failures = 0u32;
             loop {
                 if shutdown.load(Ordering::Relaxed) {
@@ -189,12 +263,22 @@ fn spawn_scan_worker(shutdown: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
                         consecutive_failures += 1;
                         tracing::warn!("scan worker: job failed ({consecutive_failures}): {e}");
                         if consecutive_failures >= 5 {
-                            tracing::error!("scan worker: too many consecutive failures, backing off");
+                            tracing::error!(
+                                "scan worker: too many consecutive failures, backing off"
+                            );
                             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                             break;
                         }
                     }
                 }
+            }
+
+            // ── Sleep until next poll cycle ─────────────────────
+            // Sleep in 2-second increments so shutdown is responsive
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_secs(WORKER_POLL_INTERVAL_SECS);
+            while tokio::time::Instant::now() < deadline && !shutdown.load(Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         }
         tracing::info!("scan worker shutting down");
@@ -286,8 +370,12 @@ fn handle_request(pool: &DbPool, req: JsonRpcRequest) -> JsonRpcResponse {
     let result = match req.method.as_str() {
         "profile_create" => handle_profile_create(pool, req.params),
         "profile_update" => handle_profile_update(pool, req.params),
+        "profile_list" => handle_profile_list(pool),
+        "profile_get" => handle_profile_get(pool, req.params),
+        "profile_delete" => handle_profile_delete(pool, req.params),
         "scan_now" => handle_scan_now(pool, req.params),
         "scan_poll" => handle_scan_poll(pool, req.params),
+        "scan_history" => handle_scan_history(pool, req.params),
         "matches_list" => handle_matches_list(pool, req.params),
         "match_get" => handle_match_get(pool, req.params),
         "subscription_set" => handle_subscription_set(pool, req.params),
@@ -528,6 +616,74 @@ fn handle_source_health(pool: &DbPool, params: Option<Value>) -> Result<Value, S
     Ok(serde_json::json!({ "sources": sources }))
 }
 
+fn handle_profile_list(pool: &DbPool) -> Result<Value, String> {
+    let profiles = pool.list_profiles().map_err(|e| e.to_string())?;
+    let items: Vec<Value> = profiles
+        .into_iter()
+        .map(|p| serde_json::to_value(&p).unwrap_or(Value::Null))
+        .collect();
+    Ok(serde_json::json!({ "profiles": items, "count": items.len() }))
+}
+
+fn handle_profile_get(pool: &DbPool, params: Option<Value>) -> Result<Value, String> {
+    let input: ProfileGetInput = serde_json::from_value(params.unwrap_or(Value::Null))
+        .map_err(|e| format!("Invalid params: {e}"))?;
+
+    let profile = pool
+        .get_profile(&input.profile_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Profile not found".to_string())?;
+
+    serde_json::to_value(&profile).map_err(|e| e.to_string())
+}
+
+fn handle_profile_delete(pool: &DbPool, params: Option<Value>) -> Result<Value, String> {
+    let input: ProfileDeleteInput = serde_json::from_value(params.unwrap_or(Value::Null))
+        .map_err(|e| format!("Invalid params: {e}"))?;
+
+    pool.get_profile(&input.profile_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Profile not found".to_string())?;
+
+    pool.delete_profile(&input.profile_id)
+        .map_err(|e| e.to_string())?;
+
+    Ok(serde_json::json!({ "deleted": true }))
+}
+
+fn handle_scan_history(pool: &DbPool, params: Option<Value>) -> Result<Value, String> {
+    let input: ScanHistoryInput = serde_json::from_value(params.unwrap_or(Value::Null))
+        .map_err(|e| format!("Invalid params: {e}"))?;
+
+    let limit = input.limit.unwrap_or(20).min(100) as usize;
+
+    let jobs = match input.profile_id {
+        Some(ref pid) => pool.list_scan_jobs(pid, limit).map_err(|e| e.to_string())?,
+        None => pool
+            .list_recent_scan_jobs(limit)
+            .map_err(|e| e.to_string())?,
+    };
+
+    let items: Vec<Value> = jobs
+        .into_iter()
+        .map(|j| {
+            serde_json::json!({
+                "job_id": j.id,
+                "profile_id": j.profile_id,
+                "status": j.status.as_str(),
+                "progress": j.progress,
+                "total": j.total,
+                "reason": j.reason,
+                "attempt_count": j.attempt_count,
+                "created_at": j.created_at.to_rfc3339(),
+                "completed_at": j.completed_at.map(|dt| dt.to_rfc3339()),
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({ "jobs": items, "count": items.len() }))
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -744,6 +900,116 @@ mod tests {
         let resp_result = resp.result.as_ref().unwrap();
         let sources = resp_result["sources"].as_array().unwrap();
         assert!(!sources.is_empty());
+    }
+
+    #[test]
+    fn test_profile_list() {
+        let pool = test_pool();
+        // Create two profiles
+        rpc_call(
+            &pool,
+            "profile_create",
+            serde_json::json!({"name": "A", "keywords": ["a"]}),
+        );
+        rpc_call(
+            &pool,
+            "profile_create",
+            serde_json::json!({"name": "B", "keywords": ["b"]}),
+        );
+        let resp = rpc_call(&pool, "profile_list", serde_json::json!({}));
+        assert!(resp.error.is_none());
+        let result = resp.result.as_ref().unwrap();
+        assert_eq!(result["count"].as_u64().unwrap(), 2);
+        assert_eq!(result["profiles"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_profile_get() {
+        let pool = test_pool();
+        let create_resp = rpc_call(
+            &pool,
+            "profile_create",
+            serde_json::json!({"name": "Lookup", "keywords": ["x"]}),
+        );
+        let pid = create_resp.result.as_ref().unwrap()["profile_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let resp = rpc_call(
+            &pool,
+            "profile_get",
+            serde_json::json!({"profile_id": pid}),
+        );
+        assert!(resp.error.is_none());
+        let result = resp.result.as_ref().unwrap();
+        assert_eq!(result["name"].as_str().unwrap(), "Lookup");
+    }
+
+    #[test]
+    fn test_profile_delete() {
+        let pool = test_pool();
+        let create_resp = rpc_call(
+            &pool,
+            "profile_create",
+            serde_json::json!({"name": "ToDelete", "keywords": ["x"]}),
+        );
+        let pid = create_resp.result.as_ref().unwrap()["profile_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let resp = rpc_call(
+            &pool,
+            "profile_delete",
+            serde_json::json!({"profile_id": pid}),
+        );
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result.as_ref().unwrap()["deleted"], true);
+
+        // Verify it's gone
+        let get_resp = rpc_call(
+            &pool,
+            "profile_get",
+            serde_json::json!({"profile_id": pid}),
+        );
+        assert!(get_resp.error.is_some());
+    }
+
+    #[test]
+    fn test_scan_history() {
+        let pool = test_pool();
+        let create_resp = rpc_call(
+            &pool,
+            "profile_create",
+            serde_json::json!({"name": "History", "keywords": ["h"]}),
+        );
+        let pid = create_resp.result.as_ref().unwrap()["profile_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Enqueue a job
+        rpc_call(
+            &pool,
+            "scan_now",
+            serde_json::json!({"profile_id": pid}),
+        );
+
+        // Query history by profile
+        let resp = rpc_call(
+            &pool,
+            "scan_history",
+            serde_json::json!({"profile_id": pid}),
+        );
+        assert!(resp.error.is_none());
+        let result = resp.result.as_ref().unwrap();
+        assert_eq!(result["count"].as_u64().unwrap(), 1);
+
+        // Query all history
+        let resp2 = rpc_call(&pool, "scan_history", serde_json::json!({}));
+        assert!(resp2.error.is_none());
+        assert!(resp2.result.as_ref().unwrap()["count"].as_u64().unwrap() >= 1);
     }
 
     #[test]
