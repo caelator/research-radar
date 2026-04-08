@@ -491,6 +491,7 @@ fn print_run(run: &research_radar_core::PipelineRun) {
         run.job_id, run.profile_id
     );
     println!("  arxiv      : {} new papers", run.arxiv_fetched);
+    println!("  s2         : {} new papers", run.s2_fetched);
     println!("  candidates : {}", run.candidates);
     println!("  deduped    : {}", run.deduped);
     println!("  scored     : {}", run.scored);

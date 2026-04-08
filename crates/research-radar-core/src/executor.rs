@@ -302,6 +302,157 @@ impl PipelineExecutor {
         inserted
     }
 
+    /// Fetch papers from Semantic Scholar and insert as sources + entries.
+    ///
+    /// Uses alias-based dedup (s2_paper_id and cross-ref arxiv_id) and
+    /// watermark tracking for incremental fetching.
+    fn fetch_s2(&self, pool: &DbPool, profile: &Profile) -> usize {
+        use crate::{ItemAlias, SourceWatermark};
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        if profile.keywords.is_empty() {
+            return 0;
+        }
+
+        let scope_hash = {
+            let mut sorted = profile.keywords.clone();
+            sorted.sort();
+            let mut h = DefaultHasher::new();
+            sorted.hash(&mut h);
+            format!("s2_{:016x}", h.finish())
+        };
+
+        let watermark = pool
+            .get_watermark(&profile.id, "semantic_scholar", &scope_hash)
+            .ok()
+            .flatten();
+
+        let papers = match tokio_block_on(semantic_scholar::fetch_s2_papers(profile, 20)) {
+            Ok(papers) => {
+                let _ = pool.upsert_source_health("semantic_scholar", true, None);
+                papers
+            }
+            Err(e) => {
+                tracing::warn!("Semantic Scholar fetch failed: {e}");
+                let _ =
+                    pool.upsert_source_health("semantic_scholar", false, Some(&e.to_string()));
+                return 0;
+            }
+        };
+
+        let mut inserted = 0;
+        let mut newest_published: Option<chrono::DateTime<chrono::Utc>> = None;
+
+        for paper in &papers {
+            // Skip papers older than watermark
+            if let Some(ref wm) = watermark {
+                if let (Some(last_pub), Some(pub_date)) =
+                    (wm.last_item_published_at, paper.publication_date)
+                {
+                    if pub_date <= last_pub {
+                        continue;
+                    }
+                }
+            }
+
+            // Alias-based dedup: check S2 paper ID
+            if let Ok(Some(_)) = pool.find_by_alias("s2_paper_id", &paper.paper_id) {
+                continue;
+            }
+
+            // Cross-source dedup: if this paper has an arxiv_id, check that too
+            if let Some(ref arxiv_id) = paper.external_ids.arxiv_id {
+                if let Ok(Some(_)) = pool.find_by_alias("arxiv_id", arxiv_id) {
+                    continue;
+                }
+            }
+
+            let (source, entry) = semantic_scholar::paper_to_source_entry(paper);
+            if pool.insert_source(&source).is_ok() && pool.insert_entry(&entry).is_ok() {
+                // Register S2 paper ID alias
+                let alias = ItemAlias::new(
+                    entry.id.clone(),
+                    "s2_paper_id".into(),
+                    paper.paper_id.clone(),
+                    "semantic_scholar".into(),
+                );
+                let _ = pool.insert_alias(&alias);
+
+                // Also register arxiv alias if available (cross-source dedup)
+                if let Some(ref arxiv_id) = paper.external_ids.arxiv_id {
+                    let arxiv_alias = ItemAlias::new(
+                        entry.id.clone(),
+                        "arxiv_id".into(),
+                        arxiv_id.clone(),
+                        "semantic_scholar".into(),
+                    );
+                    let _ = pool.insert_alias(&arxiv_alias);
+                }
+
+                // Register DOI alias if available
+                if let Some(ref doi) = paper.external_ids.doi {
+                    let doi_alias = ItemAlias::new(
+                        entry.id.clone(),
+                        "doi".into(),
+                        doi.clone(),
+                        "semantic_scholar".into(),
+                    );
+                    let _ = pool.insert_alias(&doi_alias);
+                }
+
+                inserted += 1;
+
+                if let Some(pub_date) = paper.publication_date {
+                    match newest_published {
+                        Some(cur) if pub_date > cur => {
+                            newest_published = Some(pub_date);
+                        }
+                        None => {
+                            newest_published = Some(pub_date);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Update watermark
+        if let Some(newest) = newest_published {
+            let mut wm = watermark.unwrap_or_else(|| {
+                SourceWatermark::new(
+                    profile.id.clone(),
+                    "semantic_scholar".into(),
+                    scope_hash.clone(),
+                )
+            });
+            wm.last_fetched_at = Some(Utc::now());
+            let should_advance = wm
+                .last_item_published_at
+                .map_or(true, |prev| newest > prev);
+            if should_advance {
+                wm.last_item_published_at = Some(newest);
+            }
+            let _ = pool.upsert_watermark(&wm);
+        } else if watermark.is_none() && !papers.is_empty() {
+            let mut wm = SourceWatermark::new(
+                profile.id.clone(),
+                "semantic_scholar".into(),
+                scope_hash.clone(),
+            );
+            wm.last_fetched_at = Some(Utc::now());
+            let _ = pool.upsert_watermark(&wm);
+        }
+
+        if inserted > 0 {
+            tracing::info!(
+                "S2: fetched {inserted} new papers for profile '{}'",
+                profile.name
+            );
+        }
+        inserted
+    }
+
     fn fetch_candidates(
         &self,
         pool: &DbPool,
