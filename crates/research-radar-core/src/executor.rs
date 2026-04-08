@@ -43,7 +43,6 @@ pub struct PipelineExecutor {
     scorer: Arc<dyn LlmBackend>,
     discord_webhook_url: Option<String>,
     /// If true, skips external API calls (arXiv, Semantic Scholar) in tests.
-    #[cfg(test)]
     disable_external_fetches: bool,
 }
 
@@ -53,23 +52,22 @@ impl Default for PipelineExecutor {
     }
 }
 
-#[cfg(test)]
-impl PipelineExecutor {
-    /// Create an executor for tests that should not make external API calls.
-    fn test_executor() -> Self {
-        Self {
-            scorer: Arc::new(MockBackend),
-            discord_webhook_url: None,
-            disable_external_fetches: true,
-        }
-    }
-}
-
 impl PipelineExecutor {
     pub fn new() -> Self {
         Self {
             scorer: Arc::new(MockBackend),
             discord_webhook_url: None,
+            disable_external_fetches: false,
+        }
+    }
+
+    /// Create an executor for tests that should not make external API calls.
+    #[cfg(test)]
+    pub fn test_executor() -> Self {
+        Self {
+            scorer: Arc::new(MockBackend),
+            discord_webhook_url: None,
+            disable_external_fetches: true,
         }
     }
 
@@ -77,7 +75,6 @@ impl PipelineExecutor {
         Self {
             scorer,
             discord_webhook_url: None,
-            #[cfg(test)]
             disable_external_fetches: false,
         }
     }
@@ -731,7 +728,7 @@ mod tests {
         pool.insert_entry(&entry).unwrap();
 
         let job = pool.enqueue_job(&profile.id, Some("test".into())).unwrap();
-        let run = Self::test_executor().run_next(&pool).unwrap().unwrap();
+        let run = PipelineExecutor::test_executor().run_next(&pool).unwrap().unwrap();
         assert_eq!(run.job_id, job.id);
         // The manually-added entry should be accepted
         assert!(run.accepted >= 1);
@@ -755,7 +752,7 @@ mod tests {
         pool.insert_source(&source).unwrap();
         let job = pool.enqueue_job(&profile.id, None).unwrap();
 
-        let run = Self::test_executor()
+        let run = PipelineExecutor::test_executor()
             .execute_job_by_id(&pool, &job.id)
             .unwrap();
         // At least the manually-added source created an entry
@@ -783,7 +780,7 @@ mod tests {
         let entry = Entry::new(source.id.clone(), "AI safety alignment research".into());
         pool.insert_entry(&entry).unwrap();
 
-        let executor = Self::test_executor();
+        let executor = PipelineExecutor::test_executor();
         let job = pool.enqueue_job(&profile.id, None).unwrap();
         let run = executor.execute_job_by_id(&pool, &job.id).unwrap();
         assert!(run.accepted > 0);
