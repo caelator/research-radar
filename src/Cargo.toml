@@ -18,6 +18,7 @@ serde = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
+reqwest = { workspace = true }
 
 [dev-dependencies]
 rusqlite = { workspace = true }

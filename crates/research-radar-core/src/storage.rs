@@ -1628,6 +1628,43 @@ mod sqlite {
             let jobs = pool.list_recent_scan_jobs(10).unwrap();
             assert_eq!(jobs.len(), 2);
         }
+
+        #[test]
+        fn circuit_breaker_opens_after_consecutive_failures() {
+            let pool = memory_pool();
+
+            // No health row yet — not broken
+            assert!(!pool.is_source_circuit_broken("arxiv"));
+
+            // Record 3 failures
+            pool.upsert_source_health("arxiv", false, Some("timeout"))
+                .unwrap();
+            pool.upsert_source_health("arxiv", false, Some("timeout"))
+                .unwrap();
+            pool.upsert_source_health("arxiv", false, Some("timeout"))
+                .unwrap();
+
+            // Now circuit breaker should be open
+            assert!(pool.is_source_circuit_broken("arxiv"));
+
+            // A success resets it
+            pool.upsert_source_health("arxiv", true, None).unwrap();
+            assert!(!pool.is_source_circuit_broken("arxiv"));
+        }
+
+        #[test]
+        fn circuit_breaker_respects_rate_limit_until() {
+            let pool = memory_pool();
+
+            // Insert a health row
+            pool.upsert_source_health("s2", true, None).unwrap();
+            assert!(!pool.is_source_circuit_broken("s2"));
+
+            // Set rate limit 10 minutes in the future
+            let future = chrono::Utc::now() + chrono::Duration::minutes(10);
+            pool.set_rate_limit_until("s2", future).unwrap();
+            assert!(pool.is_source_circuit_broken("s2"));
+        }
     }
 }
 
