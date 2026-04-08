@@ -201,13 +201,19 @@ fn spawn_scan_worker(shutdown: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
 
             // ── Reclaim expired leases ─────────────────────────
             match pool.reclaim_expired_leases() {
-                Ok(n) if n > 0 => {
-                    tracing::info!("scan worker: reclaimed {n} expired lease(s)");
+                Ok((reclaimed, dead_lettered)) => {
+                    if reclaimed > 0 {
+                        tracing::info!("scan worker: reclaimed {reclaimed} expired lease(s)");
+                    }
+                    if dead_lettered > 0 {
+                        tracing::warn!(
+                            "scan worker: dead-lettered {dead_lettered} job(s) (exceeded max attempts)"
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("scan worker: lease reclamation failed: {e}");
                 }
-                _ => {}
             }
 
             // ── Auto-enqueue all active profiles periodically ──

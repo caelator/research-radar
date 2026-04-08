@@ -384,6 +384,6 @@ pub use finding::{Finding, PaperRef, UrgencyLevel};
 pub use score::score_entry;
 pub use scorer::{AnthropicBackend, LlmBackend, MockBackend, ScorerResult};
 pub use storage::lance_store::Result as LanceResult;
-pub use storage::{DbPool, RadarStore, SourceHealth, SourceHealthDetail};
+pub use storage::{DbPool, RadarStore, SourceHealth, SourceHealthDetail, MAX_JOB_ATTEMPTS};
 // Re-export the sqlite StorageError directly so executor can use std::result::Result<T, StorageError>
 pub use crate::storage::StorageError;

@@ -18,12 +18,17 @@ use uuid::Uuid;
 // Re-exports for backward compatibility.
 pub use self::lance_store::RadarStore;
 pub use self::sqlite::DbPool;
-pub use self::sqlite::{SourceHealth, SourceHealthDetail, StorageError};
+pub use self::sqlite::{SourceHealth, SourceHealthDetail, StorageError, MAX_JOB_ATTEMPTS};
 
 // ─── SQLite (existing pipeline) ─────────────────────────────────────────────
 
 mod sqlite {
     use super::*;
+
+    /// Maximum number of claim attempts before a job is considered dead-lettered.
+    /// Once a job reaches this count, it will be marked failed instead of being
+    /// reclaimed back to pending.
+    pub const MAX_JOB_ATTEMPTS: u32 = 5;
 
     #[derive(Debug, thiserror::Error)]
     pub enum StorageError {
@@ -820,14 +825,16 @@ mod sqlite {
 
         pub fn claim_next_scan_job(&self) -> Result<Option<crate::ScanJob>> {
             let now = Utc::now().to_rfc3339();
-            // Find pending jobs OR running jobs with expired leases
+            // Find pending jobs OR running jobs with expired leases,
+            // but skip jobs that have exceeded the max attempt count (dead-lettered).
             let mut stmt = self.conn.prepare(
                 "SELECT id FROM scan_jobs WHERE \
-                 status = 'pending' OR \
-                 (status = 'running' AND lease_expires_at < ?1) \
+                 (status = 'pending' OR \
+                  (status = 'running' AND lease_expires_at < ?1)) \
+                 AND attempt_count < ?2 \
                  ORDER BY created_at ASC LIMIT 1",
             )?;
-            let mut rows = stmt.query(params![now])?;
+            let mut rows = stmt.query(params![now, MAX_JOB_ATTEMPTS as i64])?;
             if let Some(row) = rows.next()? {
                 let id: String = row.get(0)?;
                 drop(rows);
@@ -1274,17 +1281,31 @@ mod sqlite {
         }
 
         /// Reclaim jobs whose leases have expired — reset them to pending so
-        /// they can be picked up by another worker.  Returns the number of
-        /// jobs reclaimed.
-        pub fn reclaim_expired_leases(&self) -> Result<usize> {
+        /// they can be picked up by another worker.  Jobs that have already
+        /// reached MAX_JOB_ATTEMPTS are marked failed (dead-lettered) instead.
+        /// Returns (reclaimed, dead_lettered).
+        pub fn reclaim_expired_leases(&self) -> Result<(usize, usize)> {
             let now = Utc::now().to_rfc3339();
-            let updated = self.conn.execute(
+
+            // Dead-letter jobs that have exceeded max attempts
+            let dead_lettered = self.conn.execute(
+                "UPDATE scan_jobs SET status = 'failed', completed_at = ?1, \
+                 error_json = '{\"reason\":\"dead_letter\",\"message\":\"exceeded max attempts\"}' \
+                 WHERE status = 'running' AND lease_expires_at < ?1 \
+                 AND attempt_count >= ?2",
+                params![now, MAX_JOB_ATTEMPTS as i64],
+            )?;
+
+            // Reclaim remaining expired leases back to pending
+            let reclaimed = self.conn.execute(
                 "UPDATE scan_jobs SET status = 'pending', lease_token = NULL, \
                  lease_expires_at = NULL, claimed_by = NULL \
-                 WHERE status = 'running' AND lease_expires_at < ?1",
-                params![now],
+                 WHERE status = 'running' AND lease_expires_at < ?1 \
+                 AND attempt_count < ?2",
+                params![now, MAX_JOB_ATTEMPTS as i64],
             )?;
-            Ok(updated)
+
+            Ok((reclaimed, dead_lettered))
         }
 
         /// List recent scan jobs across all profiles, ordered newest-first.
@@ -1486,12 +1507,64 @@ mod sqlite {
                 .unwrap();
 
             // Reclaim should find and reset it
-            let reclaimed = pool.reclaim_expired_leases().unwrap();
+            let (reclaimed, dead_lettered) = pool.reclaim_expired_leases().unwrap();
             assert_eq!(reclaimed, 1);
+            assert_eq!(dead_lettered, 0);
 
             let after = pool.get_scan_job(&job.id).unwrap().unwrap();
             assert_eq!(after.status, ScanJobStatus::Pending);
             assert!(after.lease_token.is_none());
+        }
+
+        #[test]
+        fn dead_letter_exhausted_jobs() {
+            let pool = memory_pool();
+            let profile = Profile::new("Test".into(), vec!["test".into()]);
+            pool.insert_profile(&profile).unwrap();
+            let job = ScanJob::new(profile.id.clone(), None);
+            pool.insert_scan_job(&job).unwrap();
+
+            // Claim the job
+            let claimed = pool.claim_scan_job(&job.id).unwrap().unwrap();
+            assert_eq!(claimed.status, ScanJobStatus::Running);
+
+            // Set attempt_count to MAX and expire the lease
+            pool.conn
+                .execute(
+                    "UPDATE scan_jobs SET lease_expires_at = '2020-01-01T00:00:00Z', \
+                     attempt_count = ?2 WHERE id = ?1",
+                    params![job.id, MAX_JOB_ATTEMPTS as i64],
+                )
+                .unwrap();
+
+            // Reclaim should dead-letter this job, not reset it
+            let (reclaimed, dead_lettered) = pool.reclaim_expired_leases().unwrap();
+            assert_eq!(reclaimed, 0);
+            assert_eq!(dead_lettered, 1);
+
+            let after = pool.get_scan_job(&job.id).unwrap().unwrap();
+            assert_eq!(after.status, ScanJobStatus::Failed);
+        }
+
+        #[test]
+        fn claim_next_skips_dead_lettered_jobs() {
+            let pool = memory_pool();
+            let profile = Profile::new("Test".into(), vec!["test".into()]);
+            pool.insert_profile(&profile).unwrap();
+            let job = ScanJob::new(profile.id.clone(), None);
+            pool.insert_scan_job(&job).unwrap();
+
+            // Set attempt_count to MAX (but keep as pending)
+            pool.conn
+                .execute(
+                    "UPDATE scan_jobs SET attempt_count = ?2 WHERE id = ?1",
+                    params![job.id, MAX_JOB_ATTEMPTS as i64],
+                )
+                .unwrap();
+
+            // claim_next should skip this exhausted job
+            let result = pool.claim_next_scan_job().unwrap();
+            assert!(result.is_none());
         }
 
         #[test]
