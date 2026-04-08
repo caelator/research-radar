@@ -116,6 +116,21 @@ impl PipelineExecutor {
         }
     }
 
+    /// Send a heartbeat to keep the lease alive between pipeline stages.
+    fn heartbeat(&self, pool: &DbPool, job: &crate::ScanJob) {
+        if let Some(ref token) = job.lease_token {
+            match pool.heartbeat_job(&job.id, token) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!("heartbeat: lease lost for job {} (token mismatch)", job.id);
+                }
+                Err(e) => {
+                    tracing::warn!("heartbeat failed for job {}: {e}", job.id);
+                }
+            }
+        }
+    }
+
     fn execute_job(
         &self,
         pool: &DbPool,
@@ -146,9 +161,11 @@ impl PipelineExecutor {
 
         // Stage 1a: Fetch from arXiv (if keywords present)
         let arxiv_fetched = self.fetch_arxiv(pool, &profile);
+        self.heartbeat(pool, job);
 
         // Stage 1b: Fetch from Semantic Scholar
         let s2_fetched = self.fetch_s2(pool, &profile);
+        self.heartbeat(pool, job);
 
         // Stage 2: Gather candidates
         let mut candidates = self.fetch_candidates(pool, &profile)?;
@@ -159,15 +176,18 @@ impl PipelineExecutor {
 
         // Stage 4: Keyword filter + rank
         let ranked = self.rank_candidates(&profile, candidates);
+        self.heartbeat(pool, job);
 
         // Stage 5: LLM score the top candidates (bounded by max_llm_calls)
         let scored = self.llm_score(&profile, &ranked);
+        self.heartbeat(pool, job);
 
         // Stage 6: Persist scores
         let accepted = self.persist_scores(pool, &profile, &ranked, &scored)?;
 
         // Stage 7: Persist findings to LanceDB
         self.persist_findings(pool, &profile, &ranked)?;
+        self.heartbeat(pool, job);
 
         // Stage 8: Notify
         let notified = self.notify(pool, &profile, &ranked);

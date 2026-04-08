@@ -12,7 +12,64 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+// ─── Worker health tracking ──────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerHealthSnapshot {
+    pub started_at: String,
+    pub last_poll_at: Option<String>,
+    pub last_job_completed_at: Option<String>,
+    pub jobs_completed: u64,
+    pub jobs_failed: u64,
+    pub jobs_dead_lettered: u64,
+    pub consecutive_failures: u32,
+    pub is_processing: bool,
+    pub uptime_seconds: i64,
+}
+
+#[derive(Debug)]
+struct WorkerHealth {
+    started_at: chrono::DateTime<chrono::Utc>,
+    last_poll_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_job_completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    jobs_completed: u64,
+    jobs_failed: u64,
+    jobs_dead_lettered: u64,
+    consecutive_failures: u32,
+    is_processing: bool,
+}
+
+impl WorkerHealth {
+    fn new() -> Self {
+        Self {
+            started_at: chrono::Utc::now(),
+            last_poll_at: None,
+            last_job_completed_at: None,
+            jobs_completed: 0,
+            jobs_failed: 0,
+            jobs_dead_lettered: 0,
+            consecutive_failures: 0,
+            is_processing: false,
+        }
+    }
+
+    fn snapshot(&self) -> WorkerHealthSnapshot {
+        let now = chrono::Utc::now();
+        WorkerHealthSnapshot {
+            started_at: self.started_at.to_rfc3339(),
+            last_poll_at: self.last_poll_at.map(|dt| dt.to_rfc3339()),
+            last_job_completed_at: self.last_job_completed_at.map(|dt| dt.to_rfc3339()),
+            jobs_completed: self.jobs_completed,
+            jobs_failed: self.jobs_failed,
+            jobs_dead_lettered: self.jobs_dead_lettered,
+            consecutive_failures: self.consecutive_failures,
+            is_processing: self.is_processing,
+            uptime_seconds: (now - self.started_at).num_seconds(),
+        }
+    }
+}
 
 // ─── JSON-RPC types ────────────────────────────────────────────────
 
@@ -178,7 +235,10 @@ const WORKER_POLL_INTERVAL_SECS: u64 = 300;
 /// doesn't re-enqueue while jobs are still pending.
 const WORKER_ENQUEUE_INTERVAL_SECS: u64 = 600;
 
-fn spawn_scan_worker(shutdown: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
+fn spawn_scan_worker(
+    shutdown: Arc<AtomicBool>,
+    health: Arc<Mutex<WorkerHealth>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Open a dedicated DB connection for the worker
         let pool = match DbPool::init() {
@@ -199,6 +259,10 @@ fn spawn_scan_worker(shutdown: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
         while !shutdown.load(Ordering::Relaxed) {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
+            if let Ok(mut h) = health.lock() {
+                h.last_poll_at = Some(chrono::Utc::now());
+            }
+
             // ── Reclaim expired leases ─────────────────────────
             match pool.reclaim_expired_leases() {
                 Ok((reclaimed, dead_lettered)) => {
@@ -209,6 +273,9 @@ fn spawn_scan_worker(shutdown: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
                         tracing::warn!(
                             "scan worker: dead-lettered {dead_lettered} job(s) (exceeded max attempts)"
                         );
+                        if let Ok(mut h) = health.lock() {
+                            h.jobs_dead_lettered += dead_lettered as u64;
+                        }
                     }
                 }
                 Err(e) => {
@@ -250,6 +317,9 @@ fn spawn_scan_worker(shutdown: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
 
             // ── Process all available jobs in one burst ─────────
             let mut consecutive_failures = 0u32;
+            if let Ok(mut h) = health.lock() {
+                h.is_processing = true;
+            }
             loop {
                 if shutdown.load(Ordering::Relaxed) {
                     break;
@@ -257,6 +327,11 @@ fn spawn_scan_worker(shutdown: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
                 match executor.run_next(&pool) {
                     Ok(Some(run)) => {
                         consecutive_failures = 0;
+                        if let Ok(mut h) = health.lock() {
+                            h.jobs_completed += 1;
+                            h.consecutive_failures = 0;
+                            h.last_job_completed_at = Some(chrono::Utc::now());
+                        }
                         tracing::info!(
                             "scan worker: completed job {} for profile {} — {} accepted",
                             run.job_id,
@@ -267,6 +342,10 @@ fn spawn_scan_worker(shutdown: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
                     Ok(None) => break, // no more pending jobs
                     Err(e) => {
                         consecutive_failures += 1;
+                        if let Ok(mut h) = health.lock() {
+                            h.jobs_failed += 1;
+                            h.consecutive_failures = consecutive_failures;
+                        }
                         tracing::warn!("scan worker: job failed ({consecutive_failures}): {e}");
                         if consecutive_failures >= 5 {
                             tracing::error!(
@@ -277,6 +356,9 @@ fn spawn_scan_worker(shutdown: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
                         }
                     }
                 }
+            }
+            if let Ok(mut h) = health.lock() {
+                h.is_processing = false;
             }
 
             // ── Sleep until next poll cycle ─────────────────────
@@ -316,12 +398,13 @@ pub fn run_mcp_server(pool: &DbPool) -> io::Result<()> {
 
     rt.block_on(async {
         let shutdown = Arc::new(AtomicBool::new(false));
-        let worker_handle = spawn_scan_worker(Arc::clone(&shutdown));
+        let worker_health = Arc::new(Mutex::new(WorkerHealth::new()));
+        let worker_handle = spawn_scan_worker(Arc::clone(&shutdown), Arc::clone(&worker_health));
 
         // Run the stdio loop directly. This blocks the async runtime's
         // main thread, but that's fine — the scan worker runs on the
         // Tokio thread pool via `tokio::spawn`.
-        let stdio_result = run_stdio_loop(pool);
+        let stdio_result = run_stdio_loop(pool, &worker_health);
 
         // Shutdown the background worker gracefully
         shutdown.store(true, Ordering::Relaxed);
@@ -331,7 +414,7 @@ pub fn run_mcp_server(pool: &DbPool) -> io::Result<()> {
     })
 }
 
-fn run_stdio_loop(pool: &DbPool) -> io::Result<()> {
+fn run_stdio_loop(pool: &DbPool, worker_health: &Arc<Mutex<WorkerHealth>>) -> io::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut handle = stdin.lock();
@@ -361,7 +444,7 @@ fn run_stdio_loop(pool: &DbPool) -> io::Result<()> {
             }
         };
 
-        let resp = handle_request(pool, req);
+        let resp = handle_request(pool, req, worker_health);
         let out = serde_json::to_string(&resp).unwrap_or_default();
         writeln!(stdout, "{}", out)?;
         stdout.flush()?;
@@ -370,7 +453,11 @@ fn run_stdio_loop(pool: &DbPool) -> io::Result<()> {
     Ok(())
 }
 
-fn handle_request(pool: &DbPool, req: JsonRpcRequest) -> JsonRpcResponse {
+fn handle_request(
+    pool: &DbPool,
+    req: JsonRpcRequest,
+    worker_health: &Arc<Mutex<WorkerHealth>>,
+) -> JsonRpcResponse {
     let id = req.id.clone();
 
     let result = match req.method.as_str() {
@@ -386,6 +473,7 @@ fn handle_request(pool: &DbPool, req: JsonRpcRequest) -> JsonRpcResponse {
         "match_get" => handle_match_get(pool, req.params),
         "subscription_set" => handle_subscription_set(pool, req.params),
         "source_health" => handle_source_health(pool, req.params),
+        "worker_health" => handle_worker_health(worker_health),
         _ => {
             return JsonRpcResponse::error(id, -32601, "Method not found");
         }
@@ -622,6 +710,14 @@ fn handle_source_health(pool: &DbPool, params: Option<Value>) -> Result<Value, S
     Ok(serde_json::json!({ "sources": sources }))
 }
 
+fn handle_worker_health(worker_health: &Arc<Mutex<WorkerHealth>>) -> Result<Value, String> {
+    let snapshot = worker_health
+        .lock()
+        .map_err(|e| format!("health lock poisoned: {e}"))?
+        .snapshot();
+    serde_json::to_value(&snapshot).map_err(|e| e.to_string())
+}
+
 fn handle_profile_list(pool: &DbPool) -> Result<Value, String> {
     let profiles = pool.list_profiles().map_err(|e| e.to_string())?;
     let items: Vec<Value> = profiles
@@ -701,14 +797,19 @@ mod tests {
         DbPool::test_pool().expect("failed to create test pool")
     }
 
+    fn test_worker_health() -> Arc<Mutex<WorkerHealth>> {
+        Arc::new(Mutex::new(WorkerHealth::new()))
+    }
+
     fn rpc_call(pool: &DbPool, method: &str, params: Value) -> JsonRpcResponse {
+        let health = test_worker_health();
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
             id: Value::Null,
             method: method.into(),
             params: Some(params),
         };
-        handle_request(pool, req)
+        handle_request(pool, req, &health)
     }
 
     #[test]
@@ -1016,6 +1117,19 @@ mod tests {
         let resp2 = rpc_call(&pool, "scan_history", serde_json::json!({}));
         assert!(resp2.error.is_none());
         assert!(resp2.result.as_ref().unwrap()["count"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn test_worker_health_endpoint() {
+        let pool = test_pool();
+        let resp = rpc_call(&pool, "worker_health", serde_json::json!({}));
+        assert!(resp.error.is_none());
+        let result = resp.result.as_ref().unwrap();
+        assert!(result["started_at"].as_str().is_some());
+        assert_eq!(result["jobs_completed"].as_u64().unwrap(), 0);
+        assert_eq!(result["jobs_failed"].as_u64().unwrap(), 0);
+        assert_eq!(result["is_processing"].as_bool().unwrap(), false);
+        assert!(result["uptime_seconds"].as_i64().unwrap() >= 0);
     }
 
     #[test]
