@@ -375,6 +375,8 @@ pub mod executor;
 pub mod finding;
 pub mod notify;
 pub mod openalex;
+#[cfg(test)]
+mod prove_it;
 pub mod score;
 pub mod scorer;
 pub mod semantic_scholar;

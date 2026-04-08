@@ -1207,6 +1207,54 @@ mod sqlite {
             Ok(())
         }
 
+        /// Count aliases grouped by source_type. Used for per-source telemetry.
+        pub fn count_aliases_by_source(&self) -> Result<Vec<(String, u64)>> {
+            let mut stmt = self.conn.prepare(
+                "SELECT source_type, COUNT(*) FROM item_aliases GROUP BY source_type ORDER BY source_type",
+            )?;
+            let mut results = Vec::new();
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let source_type: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                results.push((source_type, count as u64));
+            }
+            Ok(results)
+        }
+
+        /// Count unique item_ids that appear in aliases from exactly one source_type.
+        /// Returns (source_type, unique_count) — items contributed *only* by that source.
+        pub fn count_unique_contributions_by_source(&self) -> Result<Vec<(String, u64)>> {
+            let mut stmt = self.conn.prepare(
+                "SELECT a.source_type, COUNT(DISTINCT a.item_id) FROM item_aliases a \
+                 WHERE a.item_id NOT IN ( \
+                     SELECT b.item_id FROM item_aliases b WHERE b.source_type != a.source_type \
+                 ) GROUP BY a.source_type ORDER BY a.source_type",
+            )?;
+            let mut results = Vec::new();
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let source_type: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                results.push((source_type, count as u64));
+            }
+            Ok(results)
+        }
+
+        /// Count items that were deduped (same item_id has aliases from multiple source_types).
+        pub fn count_cross_source_dedup_hits(&self) -> Result<u64> {
+            let count: i64 = self.conn.query_row(
+                "SELECT COUNT(DISTINCT item_id) FROM item_aliases \
+                 WHERE item_id IN ( \
+                     SELECT item_id FROM item_aliases GROUP BY item_id \
+                     HAVING COUNT(DISTINCT source_type) > 1 \
+                 )",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(count as u64)
+        }
+
         /// Find an existing item by alias (hard-ID dedup).
         pub fn find_by_alias(
             &self,
@@ -1742,6 +1790,23 @@ pub mod lance_store {
                 ))
             })?;
             Ok(home.join(".research-radar/lance"))
+        }
+
+        /// Create a test store in a temporary directory.
+        pub async fn test_store(dir: &std::path::Path) -> Result<Self> {
+            let uri = dir.to_str().ok_or_else(|| {
+                LanceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "test path not valid UTF-8",
+                ))
+            })?;
+            let conn = lancedb::connection::connect(uri)
+                .execute()
+                .await
+                .map_err(LanceError::Lance)?;
+            let store = Self { conn };
+            store.init_tables().await?;
+            Ok(store)
         }
 
         async fn init_tables(&self) -> Result<()> {

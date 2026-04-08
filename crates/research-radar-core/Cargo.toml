@@ -5,6 +5,7 @@ version.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 
 [dependencies]
 rusqlite = { workspace = true }
