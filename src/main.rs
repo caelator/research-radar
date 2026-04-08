@@ -492,6 +492,7 @@ fn print_run(run: &research_radar_core::PipelineRun) {
     );
     println!("  arxiv      : {} new papers", run.arxiv_fetched);
     println!("  s2         : {} new papers", run.s2_fetched);
+    println!("  openalex   : {} new works", run.oa_fetched);
     println!("  candidates : {}", run.candidates);
     println!("  deduped    : {}", run.deduped);
     println!("  scored     : {}", run.scored);

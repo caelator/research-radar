@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::arxiv;
 use crate::notify;
+use crate::openalex;
 use crate::scorer::{LlmBackend, MockBackend, ScorerResult};
 use crate::semantic_scholar;
 use crate::{
@@ -37,6 +38,7 @@ pub struct PipelineRun {
     pub notified: usize,
     pub arxiv_fetched: usize,
     pub s2_fetched: usize,
+    pub oa_fetched: usize,
 }
 
 pub struct PipelineExecutor {
@@ -177,6 +179,15 @@ impl PipelineExecutor {
         };
         self.heartbeat(pool, job);
 
+        // Stage 1c: Fetch from OpenAlex (if not circuit-broken)
+        let oa_fetched = if pool.is_source_circuit_broken("openalex") {
+            tracing::info!("OpenAlex circuit breaker open — skipping fetch for '{}'", profile.name);
+            0
+        } else {
+            self.fetch_openalex(pool, &profile)
+        };
+        self.heartbeat(pool, job);
+
         // Stage 2: Gather candidates
         let mut candidates = self.fetch_candidates(pool, &profile)?;
         let candidate_count = candidates.len();
@@ -229,6 +240,7 @@ impl PipelineExecutor {
             notified,
             arxiv_fetched,
             s2_fetched,
+            oa_fetched,
         })
     }
 
@@ -513,6 +525,167 @@ impl PipelineExecutor {
         if inserted > 0 {
             tracing::info!(
                 "S2: fetched {inserted} new papers for profile '{}'",
+                profile.name
+            );
+        }
+        inserted
+    }
+
+    /// Fetch works from OpenAlex and insert as sources + entries.
+    ///
+    /// Uses alias-based dedup (openalex_id and cross-ref arxiv_id/doi) and
+    /// watermark tracking for incremental fetching.
+    fn fetch_openalex(&self, pool: &DbPool, profile: &Profile) -> usize {
+        use crate::{ItemAlias, SourceWatermark};
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        if profile.keywords.is_empty() {
+            return 0;
+        }
+
+        #[cfg(test)]
+        if self.disable_external_fetches {
+            return 0;
+        }
+
+        let scope_hash = {
+            let mut sorted = profile.keywords.clone();
+            sorted.sort();
+            let mut h = DefaultHasher::new();
+            sorted.hash(&mut h);
+            format!("oa_{:016x}", h.finish())
+        };
+
+        let watermark = pool
+            .get_watermark(&profile.id, "openalex", &scope_hash)
+            .ok()
+            .flatten();
+
+        let works = match tokio_block_on(openalex::fetch_oa_works(profile, 20)) {
+            Ok(works) => {
+                let _ = pool.upsert_source_health("openalex", true, None);
+                works
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                tracing::warn!("OpenAlex fetch failed: {err_str}");
+                let _ = pool.upsert_source_health("openalex", false, Some(&err_str));
+                if err_str.contains("429") || err_str.to_lowercase().contains("rate limit") {
+                    let backoff = chrono::Utc::now() + chrono::Duration::minutes(5);
+                    let _ = pool.set_rate_limit_until("openalex", backoff);
+                    tracing::warn!("OpenAlex rate-limited — backoff until {backoff}");
+                }
+                return 0;
+            }
+        };
+
+        let mut inserted = 0;
+        let mut newest_published: Option<chrono::DateTime<chrono::Utc>> = None;
+
+        for work in &works {
+            // Skip works older than watermark
+            if let Some(ref wm) = watermark {
+                if let (Some(last_pub), Some(pub_date)) =
+                    (wm.last_item_published_at, work.publication_date)
+                {
+                    if pub_date <= last_pub {
+                        continue;
+                    }
+                }
+            }
+
+            // Alias-based dedup: check OpenAlex ID
+            if let Ok(Some(_)) = pool.find_by_alias("openalex_id", &work.openalex_id) {
+                continue;
+            }
+
+            // Cross-source dedup: check arxiv_id if present
+            if let Some(ref arxiv_id) = work.arxiv_id {
+                if let Ok(Some(_)) = pool.find_by_alias("arxiv_id", arxiv_id) {
+                    continue;
+                }
+            }
+
+            // Cross-source dedup: check DOI if present
+            if let Some(ref doi) = work.doi {
+                if let Ok(Some(_)) = pool.find_by_alias("doi", doi) {
+                    continue;
+                }
+            }
+
+            let (source, entry) = openalex::work_to_source_entry(work);
+            if pool.insert_source(&source).is_ok() && pool.insert_entry(&entry).is_ok() {
+                // Register OpenAlex ID alias
+                let alias = ItemAlias::new(
+                    entry.id.clone(),
+                    "openalex_id".into(),
+                    work.openalex_id.clone(),
+                    "openalex".into(),
+                );
+                let _ = pool.insert_alias(&alias);
+
+                // Register arxiv alias if available
+                if let Some(ref arxiv_id) = work.arxiv_id {
+                    let arxiv_alias = ItemAlias::new(
+                        entry.id.clone(),
+                        "arxiv_id".into(),
+                        arxiv_id.clone(),
+                        "openalex".into(),
+                    );
+                    let _ = pool.insert_alias(&arxiv_alias);
+                }
+
+                // Register DOI alias if available
+                if let Some(ref doi) = work.doi {
+                    let doi_alias = ItemAlias::new(
+                        entry.id.clone(),
+                        "doi".into(),
+                        doi.clone(),
+                        "openalex".into(),
+                    );
+                    let _ = pool.insert_alias(&doi_alias);
+                }
+
+                inserted += 1;
+
+                if let Some(pub_date) = work.publication_date {
+                    match newest_published {
+                        Some(cur) if pub_date > cur => {
+                            newest_published = Some(pub_date);
+                        }
+                        None => {
+                            newest_published = Some(pub_date);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Update watermark
+        if let Some(newest) = newest_published {
+            let mut wm = watermark.unwrap_or_else(|| {
+                SourceWatermark::new(profile.id.clone(), "openalex".into(), scope_hash.clone())
+            });
+            wm.last_fetched_at = Some(Utc::now());
+            let should_advance = wm
+                .last_item_published_at
+                .map_or(true, |prev| newest > prev);
+            if should_advance {
+                wm.last_item_published_at = Some(newest);
+            }
+            let _ = pool.upsert_watermark(&wm);
+        } else if watermark.is_none() && !works.is_empty() {
+            let mut wm =
+                SourceWatermark::new(profile.id.clone(), "openalex".into(), scope_hash.clone());
+            wm.last_fetched_at = Some(Utc::now());
+            let _ = pool.upsert_watermark(&wm);
+        }
+
+        if inserted > 0 {
+            tracing::info!(
+                "OpenAlex: fetched {inserted} new works for profile '{}'",
                 profile.name
             );
         }
