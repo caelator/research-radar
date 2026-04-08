@@ -1,13 +1,18 @@
-//! JSON-RPC 2.0 MCP server over stdio.
+//! JSON-RPC 2.0 MCP server over stdio with background scan worker.
 //!
 //! Reads JSON-RPC requests from stdin, writes responses to stdout.
+//! On startup, spawns a Tokio background task that polls the scan-job
+//! queue and processes jobs asynchronously so `scan_poll` tracks real progress.
 
 use research_radar_core::{
-    DbPool, Profile, ScanJobStatus, ScoredMatch, SourceHealth, Subscription,
+    AnthropicBackend, DbPool, PipelineExecutor, Profile, ScanJobStatus, ScoredMatch, SourceHealth,
+    Subscription,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{self, BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 // ─── JSON-RPC types ────────────────────────────────────────────────
 
@@ -140,10 +145,96 @@ pub struct SourceHealthInput {
     pub source_type: Option<String>,
 }
 
+// ─── Background scan worker ────────────────────────────────────────
+
+/// Spawn a background Tokio task that polls for pending scan jobs and
+/// executes them. Runs until `shutdown` is set to `true`.
+///
+/// Opens its own DbPool so the main stdio thread retains exclusive
+/// ownership of its connection.
+fn spawn_scan_worker(shutdown: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Open a dedicated DB connection for the worker
+        let pool = match DbPool::init() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("scan worker: failed to open database: {e}");
+                return;
+            }
+        };
+        let executor = build_executor();
+
+        tracing::info!("scan worker started");
+        while !shutdown.load(Ordering::Relaxed) {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            // Process all available jobs in one burst
+            loop {
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                match executor.run_next(&pool) {
+                    Ok(Some(run)) => {
+                        tracing::info!(
+                            "scan worker: completed job {} for profile {} — {} accepted",
+                            run.job_id,
+                            run.profile_id,
+                            run.accepted
+                        );
+                    }
+                    Ok(None) => break, // no more pending jobs
+                    Err(e) => {
+                        tracing::warn!("scan worker: job failed: {e}");
+                        break;
+                    }
+                }
+            }
+        }
+        tracing::info!("scan worker shutting down");
+    })
+}
+
+fn build_executor() -> PipelineExecutor {
+    let discord_webhook_url = std::env::var("DISCORD_WEBHOOK_URL")
+        .ok()
+        .filter(|u| !u.is_empty());
+    let executor = match std::env::var("ANTHROPIC_API_KEY") {
+        Ok(key) if !key.is_empty() => {
+            PipelineExecutor::with_scorer(Arc::new(AnthropicBackend::new(key)))
+        }
+        _ => PipelineExecutor::new(),
+    };
+    executor.with_discord_webhook_url(discord_webhook_url)
+}
+
 // ─── Server implementation ──────────────────────────────────────────
 
-/// Start the MCP server loop: read JSON-RPC requests from stdin, respond to stdout.
+/// Start the MCP server: spawn background scan worker, then read
+/// JSON-RPC requests from stdin and respond to stdout.
 pub fn run_mcp_server(pool: &DbPool) -> io::Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+    rt.block_on(async {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_handle = spawn_scan_worker(Arc::clone(&shutdown));
+
+        // Run the stdio loop directly. This blocks the async runtime's
+        // main thread, but that's fine — the scan worker runs on the
+        // Tokio thread pool via `tokio::spawn`.
+        let stdio_result = run_stdio_loop(pool);
+
+        // Shutdown the background worker gracefully
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = worker_handle.await;
+
+        stdio_result
+    })
+}
+
+fn run_stdio_loop(pool: &DbPool) -> io::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut handle = stdin.lock();
@@ -208,9 +299,8 @@ fn handle_request(pool: &DbPool, req: JsonRpcRequest) -> JsonRpcResponse {
 // ─── Tool handlers ─────────────────────────────────────────────────
 
 fn handle_profile_create(pool: &DbPool, params: Option<Value>) -> Result<Value, String> {
-    let input: ProfileCreateInput =
-        serde_json::from_value(params.unwrap_or(Value::Null))
-            .map_err(|e| format!("Invalid params: {e}"))?;
+    let input: ProfileCreateInput = serde_json::from_value(params.unwrap_or(Value::Null))
+        .map_err(|e| format!("Invalid params: {e}"))?;
 
     let mut profile = Profile::new(input.name, input.keywords);
     if let Some(nk) = input.negative_keywords {
@@ -232,9 +322,8 @@ fn handle_profile_create(pool: &DbPool, params: Option<Value>) -> Result<Value, 
 }
 
 fn handle_profile_update(pool: &DbPool, params: Option<Value>) -> Result<Value, String> {
-    let input: ProfileUpdateInput =
-        serde_json::from_value(params.unwrap_or(Value::Null))
-            .map_err(|e| format!("Invalid params: {e}"))?;
+    let input: ProfileUpdateInput = serde_json::from_value(params.unwrap_or(Value::Null))
+        .map_err(|e| format!("Invalid params: {e}"))?;
 
     let mut profile = pool
         .get_profile(&input.profile_id)
@@ -259,14 +348,12 @@ fn handle_profile_update(pool: &DbPool, params: Option<Value>) -> Result<Value, 
 
     pool.update_profile(&profile).map_err(|e| e.to_string())?;
 
-    serde_json::to_value(&profile)
-        .map_err(|e| e.to_string())
+    serde_json::to_value(&profile).map_err(|e| e.to_string())
 }
 
 fn handle_scan_now(pool: &DbPool, params: Option<Value>) -> Result<Value, String> {
-    let input: ScanNowInput =
-        serde_json::from_value(params.unwrap_or(Value::Null))
-            .map_err(|e| format!("Invalid params: {e}"))?;
+    let input: ScanNowInput = serde_json::from_value(params.unwrap_or(Value::Null))
+        .map_err(|e| format!("Invalid params: {e}"))?;
 
     // Verify profile exists
     pool.get_profile(&input.profile_id)
@@ -275,7 +362,10 @@ fn handle_scan_now(pool: &DbPool, params: Option<Value>) -> Result<Value, String
 
     // Check for existing active job
     if input.force != Some(true) {
-        if let Some(active) = pool.get_active_scan_job(&input.profile_id).map_err(|e| e.to_string())? {
+        if let Some(active) = pool
+            .get_active_scan_job(&input.profile_id)
+            .map_err(|e| e.to_string())?
+        {
             return Ok(serde_json::json!({
                 "job_id": active.id,
                 "reused": true
@@ -299,9 +389,8 @@ fn handle_scan_now(pool: &DbPool, params: Option<Value>) -> Result<Value, String
 }
 
 fn handle_scan_poll(pool: &DbPool, params: Option<Value>) -> Result<Value, String> {
-    let input: ScanPollInput =
-        serde_json::from_value(params.unwrap_or(Value::Null))
-            .map_err(|e| format!("Invalid params: {e}"))?;
+    let input: ScanPollInput = serde_json::from_value(params.unwrap_or(Value::Null))
+        .map_err(|e| format!("Invalid params: {e}"))?;
 
     let job = pool
         .get_scan_job(&input.job_id)
@@ -324,9 +413,8 @@ fn handle_scan_poll(pool: &DbPool, params: Option<Value>) -> Result<Value, Strin
 }
 
 fn handle_matches_list(pool: &DbPool, params: Option<Value>) -> Result<Value, String> {
-    let input: MatchesListInput =
-        serde_json::from_value(params.unwrap_or(Value::Null))
-            .map_err(|e| format!("Invalid params: {e}"))?;
+    let input: MatchesListInput = serde_json::from_value(params.unwrap_or(Value::Null))
+        .map_err(|e| format!("Invalid params: {e}"))?;
 
     let profile_id = input
         .profile_id
@@ -358,9 +446,8 @@ fn handle_matches_list(pool: &DbPool, params: Option<Value>) -> Result<Value, St
 }
 
 fn handle_match_get(pool: &DbPool, params: Option<Value>) -> Result<Value, String> {
-    let input: MatchGetInput =
-        serde_json::from_value(params.unwrap_or(Value::Null))
-            .map_err(|e| format!("Invalid params: {e}"))?;
+    let input: MatchGetInput = serde_json::from_value(params.unwrap_or(Value::Null))
+        .map_err(|e| format!("Invalid params: {e}"))?;
 
     let entry = pool
         .get_entry(&input.item_id)
@@ -384,9 +471,8 @@ fn handle_match_get(pool: &DbPool, params: Option<Value>) -> Result<Value, Strin
 }
 
 fn handle_subscription_set(pool: &DbPool, params: Option<Value>) -> Result<Value, String> {
-    let input: SubscriptionSetInput =
-        serde_json::from_value(params.unwrap_or(Value::Null))
-            .map_err(|e| format!("Invalid params: {e}"))?;
+    let input: SubscriptionSetInput = serde_json::from_value(params.unwrap_or(Value::Null))
+        .map_err(|e| format!("Invalid params: {e}"))?;
 
     // Verify profile exists
     pool.get_profile(&input.profile_id)
@@ -405,22 +491,15 @@ fn handle_subscription_set(pool: &DbPool, params: Option<Value>) -> Result<Value
         return Ok(serde_json::json!({ "subscription_id": existing.id }));
     }
 
-    let sub = Subscription::new(
-        input.profile_id,
-        input.channel,
-        input.config,
-        input.enabled,
-    );
-    pool.insert_subscription(&sub)
-        .map_err(|e| e.to_string())?;
+    let sub = Subscription::new(input.profile_id, input.channel, input.config, input.enabled);
+    pool.insert_subscription(&sub).map_err(|e| e.to_string())?;
 
     Ok(serde_json::json!({ "subscription_id": sub.id }))
 }
 
 fn handle_source_health(pool: &DbPool, params: Option<Value>) -> Result<Value, String> {
-    let input: SourceHealthInput =
-        serde_json::from_value(params.unwrap_or(Value::Null))
-            .map_err(|e| format!("Invalid params: {e}"))?;
+    let input: SourceHealthInput = serde_json::from_value(params.unwrap_or(Value::Null))
+        .map_err(|e| format!("Invalid params: {e}"))?;
 
     let health: Vec<SourceHealth> = pool
         .get_source_health(input.source_type.as_deref())
@@ -551,11 +630,7 @@ mod tests {
         assert_eq!(scan_result2["job_id"].as_str().unwrap(), job_id);
         assert_eq!(scan_result2["reused"], true);
 
-        let poll_resp = rpc_call(
-            &pool,
-            "scan_poll",
-            serde_json::json!({"job_id": job_id}),
-        );
+        let poll_resp = rpc_call(&pool, "scan_poll", serde_json::json!({"job_id": job_id}));
         assert!(poll_resp.error.is_none());
         let poll_result = poll_resp.result.as_ref().unwrap();
         assert_eq!(poll_result["status"].as_str().unwrap(), "pending");
@@ -581,7 +656,8 @@ mod tests {
             SourceType::Web,
         );
         pool.insert_source(&src).unwrap();
-        let entry = research_radar_core::Entry::new(src.id.clone(), "AI safety research paper".into());
+        let entry =
+            research_radar_core::Entry::new(src.id.clone(), "AI safety research paper".into());
         pool.insert_entry(&entry).unwrap();
         pool.upsert_item_score(&entry.id, profile_id, 0.85, "new")
             .unwrap();
@@ -656,11 +732,7 @@ mod tests {
         let entry = research_radar_core::Entry::new(src.id.clone(), "AI content".into());
         pool.insert_entry(&entry).unwrap();
 
-        let resp = rpc_call(
-            &pool,
-            "source_health",
-            serde_json::json!({}),
-        );
+        let resp = rpc_call(&pool, "source_health", serde_json::json!({}));
         assert!(resp.error.is_none());
         let resp_result = resp.result.as_ref().unwrap();
         let sources = resp_result["sources"].as_array().unwrap();

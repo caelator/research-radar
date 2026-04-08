@@ -1,6 +1,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
+use research_radar_core::RadarStore;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
@@ -12,13 +13,23 @@ fn run_cli(home: &std::path::Path, args: &[&str]) -> std::process::Output {
         .expect("failed to run research-radar")
 }
 
-fn rpc_call(stdin: &mut dyn Write, reader: &mut BufReader<std::process::ChildStdout>, id: i64, method: &str, params: Value) -> Value {
-    writeln!(stdin, "{}", json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": method,
-        "params": params,
-    }))
+fn rpc_call(
+    stdin: &mut dyn Write,
+    reader: &mut BufReader<std::process::ChildStdout>,
+    id: i64,
+    method: &str,
+    params: Value,
+) -> Value {
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        })
+    )
     .unwrap();
 
     let mut line = String::new();
@@ -29,16 +40,26 @@ fn rpc_call(stdin: &mut dyn Write, reader: &mut BufReader<std::process::ChildStd
 #[test]
 fn full_pipeline_runs_through_mcp_and_scan_once() {
     let home = TempDir::new().unwrap();
+    unsafe {
+        std::env::set_var("HOME", home.path());
+    }
 
-    let add_output = run_cli(home.path(), &[
-        "add",
-        "https://example.com/ai-safety",
-        "--title",
-        "AI Safety Weekly",
-        "--source-type",
-        "web",
-    ]);
-    assert!(add_output.status.success(), "add failed: {}", String::from_utf8_lossy(&add_output.stderr));
+    let add_output = run_cli(
+        home.path(),
+        &[
+            "add",
+            "https://example.com/ai-safety",
+            "--title",
+            "AI Safety Weekly",
+            "--source-type",
+            "web",
+        ],
+    );
+    assert!(
+        add_output.status.success(),
+        "add failed: {}",
+        String::from_utf8_lossy(&add_output.stderr)
+    );
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_research-radar"))
         .env("HOME", home.path())
@@ -63,7 +84,10 @@ fn full_pipeline_runs_through_mcp_and_scan_once() {
             "score_threshold": 0.5
         }),
     );
-    let profile_id = created["result"]["profile_id"].as_str().unwrap().to_string();
+    let profile_id = created["result"]["profile_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let subscription = rpc_call(
         &mut stdin,
@@ -77,7 +101,10 @@ fn full_pipeline_runs_through_mcp_and_scan_once() {
             "enabled": true
         }),
     );
-    assert!(subscription["error"].is_null(), "subscription_set failed: {subscription}");
+    assert!(
+        subscription["error"].is_null(),
+        "subscription_set failed: {subscription}"
+    );
 
     let scan_now = rpc_call(
         &mut stdin,
@@ -99,7 +126,11 @@ fn full_pipeline_runs_through_mcp_and_scan_once() {
     assert_eq!(pending["result"]["status"], "pending");
 
     let scan_once = run_cli(home.path(), &["scan-once"]);
-    assert!(scan_once.status.success(), "scan-once failed: {}", String::from_utf8_lossy(&scan_once.stderr));
+    assert!(
+        scan_once.status.success(),
+        "scan-once failed: {}",
+        String::from_utf8_lossy(&scan_once.stderr)
+    );
 
     let complete = rpc_call(
         &mut stdin,
@@ -118,9 +149,30 @@ fn full_pipeline_runs_through_mcp_and_scan_once() {
         json!({"profile_id": profile_id}),
     );
     let items = matches["result"]["items"].as_array().unwrap();
-    assert_eq!(items.len(), 1);
+    // At least the manually-added source should match; arXiv may add more
+    assert!(!items.is_empty(), "expected at least 1 matched item, got 0");
     assert!(items[0]["score"].as_f64().unwrap() >= 0.5);
-    assert_eq!(items[0]["disposition"], "new");
+
+    let findings = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(async {
+            let store = RadarStore::init().await.expect("open radar store");
+            store
+                .list_actionable_findings(50)
+                .await
+                .expect("list findings")
+        });
+    assert!(!findings.is_empty(), "expected at least 1 finding");
+    // Verify our manually-added source is among the findings
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.source_title == "AI Safety Weekly"),
+        "AI Safety Weekly not found in findings"
+    );
+    assert!(findings.iter().all(|f| !f.related_entry_ids.is_empty()));
 
     drop(stdin);
     let status = child.wait().unwrap();

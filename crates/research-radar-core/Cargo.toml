@@ -15,3 +15,12 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 dirs = { workspace = true }
+lancedb = "0.27.2"
+arrow = "57.2"
+arrow-array = "57.2"
+arrow-schema = "57.2"
+tokio = { workspace = true }
+futures = "0.3"
+reqwest = { version = "0.12", features = ["json"] }
+async-trait = "0.1"
+quick-xml = { version = "0.37", features = ["serialize"] }

@@ -460,8 +460,7 @@ mod tests {
         let json_bytes = serde_json::to_vec(&f).expect("serialization succeeds");
         let value: serde_json::Value =
             serde_json::from_slice(&json_bytes).expect("json parse succeeds");
-        let parsed: Finding =
-            serde_json::from_value(value).expect("finding deserialize succeeds");
+        let parsed: Finding = serde_json::from_value(value).expect("finding deserialize succeeds");
 
         assert_eq!(parsed.id, f.id);
         assert_eq!(parsed.title, f.title);

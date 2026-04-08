@@ -249,7 +249,12 @@ pub struct Subscription {
 }
 
 impl Subscription {
-    pub fn new(profile_id: String, channel: String, config: serde_json::Value, enabled: bool) -> Self {
+    pub fn new(
+        profile_id: String,
+        channel: String,
+        config: serde_json::Value,
+        enabled: bool,
+    ) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             profile_id,
@@ -273,12 +278,20 @@ pub struct ScoredMatch {
 
 // ─── Re-exports ──────────────────────────────────────────────────────
 
+pub mod arxiv;
+pub mod embedding;
 pub mod executor;
 pub mod finding;
+pub mod notify;
 pub mod score;
+pub mod scorer;
 pub mod storage;
 
 pub use executor::{PipelineExecutor, PipelineRun};
 pub use finding::{Finding, PaperRef, UrgencyLevel};
 pub use score::score_entry;
-pub use storage::{DbPool, SourceHealth, StorageError};
+pub use scorer::{AnthropicBackend, LlmBackend, MockBackend, ScorerResult};
+pub use storage::lance_store::Result as LanceResult;
+pub use storage::{DbPool, RadarStore, SourceHealth};
+// Re-export the sqlite StorageError directly so executor can use std::result::Result<T, StorageError>
+pub use crate::storage::StorageError;
