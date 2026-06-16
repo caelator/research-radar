@@ -104,10 +104,7 @@ const OA_API_BASE: &str = "https://api.openalex.org";
 ///
 /// Returns up to `max_results` works. Uses the /works search endpoint
 /// with relevance sorting.
-pub async fn fetch_oa_works(
-    profile: &Profile,
-    max_results: usize,
-) -> Result<Vec<OaWork>, OaError> {
+pub async fn fetch_oa_works(profile: &Profile, max_results: usize) -> Result<Vec<OaWork>, OaError> {
     if profile.keywords.is_empty() {
         return Ok(Vec::new());
     }
@@ -198,10 +195,9 @@ pub fn work_to_source_entry(work: &OaWork) -> (Source, Entry) {
 
 fn build_query(profile: &Profile) -> String {
     // OpenAlex search is natural-language. Join keywords with spaces.
-    let positive = profile.keywords.join(" ");
     // OpenAlex doesn't support negation in search, so negative keywords
     // are handled later at the filtering/ranking stage.
-    positive
+    profile.keywords.join(" ")
 }
 
 /// Reconstruct abstract text from OpenAlex's inverted index format.
@@ -251,7 +247,9 @@ fn convert_result(r: OaRawWork) -> Option<OaWork> {
     });
 
     // Extract arXiv ID from DOI if it's an arXiv DOI, or from the OpenAlex IDs
-    let doi_raw = r.doi.or_else(|| r.ids.as_ref().and_then(|ids| ids.doi.clone()));
+    let doi_raw = r
+        .doi
+        .or_else(|| r.ids.as_ref().and_then(|ids| ids.doi.clone()));
     let doi = doi_raw.as_deref().map(normalize_doi).map(String::from);
     let arxiv_id = doi
         .as_deref()
@@ -378,7 +376,10 @@ mod tests {
 
     #[test]
     fn normalize_doi_strips_prefix() {
-        assert_eq!(normalize_doi("https://doi.org/10.1234/test"), "10.1234/test");
+        assert_eq!(
+            normalize_doi("https://doi.org/10.1234/test"),
+            "10.1234/test"
+        );
         assert_eq!(normalize_doi("http://doi.org/10.1234/test"), "10.1234/test");
         assert_eq!(normalize_doi("10.1234/test"), "10.1234/test");
     }

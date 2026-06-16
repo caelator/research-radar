@@ -1,0 +1,40 @@
+{
+  "contract_version": "2026-03-10",
+  "finding": {
+    "applicability_hypothesis": "Structured concurrency bounds task lifetimes to a parent scope, eliminating orphaned tasks and making cancellation deterministic. — Refactor the agent runtime to spawn child tasks inside a JoinSet owned by the supervising scope. (domain: rust-async)",
+    "applicability_tags": [
+      "async-runtime",
+      "tokio",
+      "task-supervision"
+    ],
+    "citation": {
+      "authors": "A. Researcher and B. Engineer",
+      "title": "Structured Concurrency for Resilient Agents",
+      "url": "https://arxiv.org/abs/2603.01234",
+      "venue": "ICLR",
+      "year": 2026
+    },
+    "confidence": 0.8199999928474426,
+    "discovered_at": "2026-03-10T08:30:00+00:00",
+    "domain": "rust-async",
+    "finding_id": "finding-golden-0001",
+    "impact_weight": 0.6499999761581421,
+    "novelty_score": 0.5,
+    "proposed_urgency": "high",
+    "schema_version": "1.0",
+    "source_kind": "paper",
+    "source_title": "Structured Concurrency for Resilient Agents",
+    "source_url": "https://arxiv.org/abs/2603.01234",
+    "suggested_action": "Refactor the agent runtime to spawn child tasks inside a JoinSet owned by the supervising scope.",
+    "summary": "Structured concurrency bounds task lifetimes to a parent scope, eliminating orphaned tasks and making cancellation deterministic.",
+    "title": "Adopt structured concurrency for agent task supervision",
+    "weakness_link": {
+      "gap_summary": "Adopt structured concurrency for agent task supervision",
+      "link": "propose_capability_gap"
+    }
+  },
+  "producer": "research-radar",
+  "project_id": "triumvirate",
+  "request_id": "req-golden-0001",
+  "sent_at": "2026-03-10T09:00:00+00:00"
+}

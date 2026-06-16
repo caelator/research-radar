@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::pricing::{cost_microunits, Usage};
 use crate::{Entry, Profile};
 
 /// Result of LLM scoring for a single entry.
@@ -20,6 +21,8 @@ pub struct ScorerResult {
     pub rationale: String,
     /// Disposition: "matched", "scored_below_threshold", "llm_failed".
     pub disposition: String,
+    /// Anthropic call cost in microunits, or zero for deterministic/fallback scoring.
+    pub cost_microunits: i64,
 }
 
 /// Errors from the scoring backend.
@@ -56,7 +59,7 @@ impl AnthropicBackend {
     pub fn new(api_key: String) -> Self {
         Self {
             api_key,
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             client: reqwest::Client::new(),
             base_url: "https://api.anthropic.com".to_string(),
         }
@@ -108,6 +111,8 @@ Respond with ONLY valid JSON (no markdown, no code fences):
 #[derive(Debug, Deserialize)]
 struct AnthropicResponse {
     content: Vec<AnthropicContent>,
+    #[serde(default)]
+    usage: Usage,
 }
 
 #[derive(Debug, Deserialize)]
@@ -209,6 +214,7 @@ impl LlmBackend for AnthropicBackend {
                 })?;
 
             let score = parsed.score.clamp(0.0, 1.0);
+            let cost = cost_microunits(&self.model, &api_resp.usage);
             let disposition = if score >= profile.score_threshold {
                 "matched"
             } else {
@@ -220,6 +226,7 @@ impl LlmBackend for AnthropicBackend {
                 reason: parsed.reason,
                 rationale: parsed.rationale,
                 disposition: disposition.to_string(),
+                cost_microunits: cost,
             });
         }
     }
@@ -249,6 +256,7 @@ impl LlmBackend for MockBackend {
                 profile.keywords.len()
             ),
             disposition: disposition.to_string(),
+            cost_microunits: 0,
         })
     }
 }
@@ -291,6 +299,7 @@ mod tests {
         let result = backend.score(&test_entry(), &test_profile()).await.unwrap();
         assert!(result.score > 0.0);
         assert_eq!(result.disposition, "matched");
+        assert_eq!(result.cost_microunits, 0);
         assert!(!result.reason.is_empty());
     }
 
@@ -361,7 +370,8 @@ mod tests {
             "content": [{
                 "type": "text",
                 "text": "{\"score\": 0.85, \"reason\": \"Highly relevant AI safety paper\", \"rationale\": \"The paper covers RLHF alignment which matches all profile keywords.\"}"
-            }]
+            }],
+            "usage": {"input_tokens": 1000, "output_tokens": 500}
         });
 
         let (server, base_url) = mock_anthropic_server(&api_response.to_string(), 200).await;
@@ -372,6 +382,7 @@ mod tests {
         assert!((result.score - 0.85).abs() < 0.001);
         assert_eq!(result.reason, "Highly relevant AI safety paper");
         assert_eq!(result.disposition, "matched");
+        assert_eq!(result.cost_microunits, 10500);
 
         server.await.unwrap();
     }
