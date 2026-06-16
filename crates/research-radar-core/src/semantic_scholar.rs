@@ -145,11 +145,7 @@ pub async fn fetch_s2_papers(
         .await
         .map_err(|e| S2Error::Parse(e.to_string()))?;
 
-    let papers = body
-        .data
-        .into_iter()
-        .filter_map(|r| convert_result(r))
-        .collect();
+    let papers = body.data.into_iter().filter_map(convert_result).collect();
 
     Ok(papers)
 }
@@ -214,15 +210,18 @@ fn convert_result(r: S2SearchResult) -> Option<S2Paper> {
             .map(|nd| nd.and_hms_opt(0, 0, 0).unwrap().and_utc())
     });
 
-    let external_ids = r.external_ids.map(|ext| S2ExternalIds {
-        arxiv_id: ext.arxiv,
-        doi: ext.doi,
-        corpus_id: ext.corpus_id.and_then(|v| match v {
-            serde_json::Value::Number(n) => Some(n.to_string()),
-            serde_json::Value::String(s) => Some(s),
-            _ => None,
-        }),
-    }).unwrap_or_default();
+    let external_ids = r
+        .external_ids
+        .map(|ext| S2ExternalIds {
+            arxiv_id: ext.arxiv,
+            doi: ext.doi,
+            corpus_id: ext.corpus_id.and_then(|v| match v {
+                serde_json::Value::Number(n) => Some(n.to_string()),
+                serde_json::Value::String(s) => Some(s),
+                _ => None,
+            }),
+        })
+        .unwrap_or_default();
 
     let url = r
         .url
@@ -233,11 +232,7 @@ fn convert_result(r: S2SearchResult) -> Option<S2Paper> {
         paper_id,
         title,
         abstract_text: r.abstract_text.unwrap_or_default(),
-        authors: r
-            .authors
-            .into_iter()
-            .filter_map(|a| a.name)
-            .collect(),
+        authors: r.authors.into_iter().filter_map(|a| a.name).collect(),
         year: r.year,
         venue: r.venue.filter(|v| !v.is_empty()),
         citation_count: r.citation_count,
