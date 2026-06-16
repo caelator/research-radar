@@ -388,9 +388,17 @@ mod tests {
     }
 
     #[test]
-    fn unconfigured_is_noop() {
-        std::env::remove_var("RADAR_TRIUMVIRATE_BASE_URL");
-        std::env::remove_var("RADAR_TRIUMVIRATE_PROJECT_ID");
+    fn kill_switch_is_noop() {
+        let _guard = crate::storage::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var("RADAR_TRIUMVIRATE_DISABLE").ok();
+        std::env::set_var("RADAR_TRIUMVIRATE_DISABLE", "1");
         assert!(PublishConfig::from_env().is_none());
+        if let Some(previous) = previous {
+            std::env::set_var("RADAR_TRIUMVIRATE_DISABLE", previous);
+        } else {
+            std::env::remove_var("RADAR_TRIUMVIRATE_DISABLE");
+        }
     }
 }

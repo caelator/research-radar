@@ -270,10 +270,10 @@ fn spawn_scan_worker(
             .map(|config| config.poll_interval_secs)
             .unwrap_or(0);
         if feedback_config.is_none() {
-            tracing::info!("scan worker: Triumvirate feedback polling disabled (not configured)");
+            tracing::info!("scan worker: Triumvirate feedback polling disabled (kill switch RADAR_TRIUMVIRATE_DISABLE or zero poll interval)");
         }
         if publish_config.is_none() {
-            tracing::info!("scan worker: Triumvirate auto-publish disabled (not configured)");
+            tracing::info!("scan worker: Triumvirate auto-publish disabled (kill switch RADAR_TRIUMVIRATE_DISABLE set)");
         }
         let mut last_feedback_poll = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(feedback_interval))

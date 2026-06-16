@@ -7,7 +7,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::arxiv;
-use crate::embedding::EmbeddingBackend;
 use crate::github;
 use crate::notify;
 use crate::openalex;
@@ -1169,7 +1168,7 @@ impl PipelineExecutor {
 
         let store = tokio_block_on(RadarStore::init())
             .map_err(|err| StorageError::Io(std::io::Error::other(err.to_string())))?;
-        let embed_backend = crate::embedding::HttpEmbeddingBackend::from_env();
+        let embed_backend = crate::embedding::active_embedding_backend();
         let priors: Vec<Vec<f32>> = match &embed_backend {
             Some(_) => tokio_block_on(store.fetch_finding_embeddings(1000)).unwrap_or_default(),
             None => Vec::new(),

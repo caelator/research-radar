@@ -34,12 +34,18 @@ pub enum FeedbackError {
 
 impl FeedbackConfig {
     pub fn from_env() -> Option<FeedbackConfig> {
-        let base_url = std::env::var("RADAR_TRIUMVIRATE_BASE_URL").ok()?;
-        let project_id = std::env::var("RADAR_TRIUMVIRATE_PROJECT_ID").ok()?;
-        if base_url.is_empty() || project_id.is_empty() {
+        if env_truthy("RADAR_TRIUMVIRATE_DISABLE") {
             return None;
         }
 
+        let base_url = std::env::var("RADAR_TRIUMVIRATE_BASE_URL")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "http://127.0.0.1:8400".to_string());
+        let project_id = std::env::var("RADAR_TRIUMVIRATE_PROJECT_ID")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "triumvirate".to_string());
         let poll_interval_secs = std::env::var("RADAR_FEEDBACK_POLL_SECS")
             .ok()
             .filter(|value| !value.is_empty())
@@ -60,6 +66,12 @@ impl FeedbackConfig {
             poll_interval_secs,
         })
     }
+}
+
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| matches!(value.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
 }
 
 impl FeedbackPoller {
