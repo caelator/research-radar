@@ -116,7 +116,8 @@ pub async fn fetch_s2_papers(
         S2_FIELDS,
     );
 
-    let mut req = reqwest::Client::new()
+    let client = crate::http_client().map_err(|e| S2Error::Http(e.to_string()))?;
+    let mut req = client
         .get(&url)
         .header("User-Agent", "research-radar/0.1");
 

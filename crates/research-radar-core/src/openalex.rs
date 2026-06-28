@@ -132,7 +132,8 @@ pub async fn fetch_oa_works(
         }
     }
 
-    let resp = reqwest::Client::new()
+    let client = crate::http_client().map_err(|e| OaError::Http(e.to_string()))?;
+    let resp = client
         .get(&url)
         .header("User-Agent", "research-radar/0.1")
         .send()

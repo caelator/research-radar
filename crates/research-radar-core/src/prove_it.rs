@@ -133,9 +133,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn lease_expiry_reclaim_and_recovery_lifecycle() {
         let tmp_home = tempfile::TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("HOME", tmp_home.path());
-        }
+        let lance_dir = tmp_home.path().join("lance");
         let pool = memory_pool();
         let profile = Profile::new("resilience-test".into(), vec!["test".into()]);
         pool.insert_profile(&profile).unwrap();
@@ -172,7 +170,8 @@ mod tests {
         assert!(after_reclaim.lease_token.is_none());
 
         // Step 4: Re-claim and run to completion
-        let executor = PipelineExecutor::test_executor();
+        let executor = PipelineExecutor::test_executor()
+            .with_lance_store_path(&lance_dir);
         let run = executor.run_next(&pool).unwrap().unwrap();
         assert_eq!(run.job_id, job.id);
 
@@ -238,9 +237,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn self_scheduling_sequential_jobs() {
         let tmp_home = tempfile::TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("HOME", tmp_home.path());
-        }
+        let lance_dir = tmp_home.path().join("lance");
 
         let pool = memory_pool();
         let profile = Profile::new("schedule-test".into(), vec!["rust".into()]);
@@ -254,7 +251,8 @@ mod tests {
         let entry = Entry::new(source.id.clone(), "rust async runtime improvements".into());
         pool.insert_entry(&entry).unwrap();
 
-        let executor = PipelineExecutor::test_executor();
+        let executor = PipelineExecutor::test_executor()
+            .with_lance_store_path(&lance_dir);
 
         // Enqueue 3 sequential jobs (each must complete before the next is created)
         let mut completed_jobs = Vec::new();
@@ -286,9 +284,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn pipeline_completes_with_all_sources_broken() {
         let tmp_home = tempfile::TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("HOME", tmp_home.path());
-        }
+        let lance_dir = tmp_home.path().join("lance");
         let pool = memory_pool();
         let profile = Profile::new("degraded-test".into(), vec!["AI".into()]);
         pool.insert_profile(&profile).unwrap();
@@ -311,7 +307,8 @@ mod tests {
 
         // Pipeline should still work (using pre-existing entries)
         let job = pool.enqueue_job(&profile.id, None).unwrap();
-        let executor = PipelineExecutor::test_executor();
+        let executor = PipelineExecutor::test_executor()
+            .with_lance_store_path(&lance_dir);
         let run = executor.run_next(&pool).unwrap().unwrap();
         assert_eq!(run.job_id, job.id);
         assert_eq!(run.arxiv_fetched, 0);
@@ -503,14 +500,8 @@ mod tests {
     /// findings that a consumer can query from LanceDB.
     #[tokio::test(flavor = "multi_thread")]
     async fn pipeline_produces_queryable_findings() {
-        let _tmp = tempfile::TempDir::new().unwrap();
         let tmp_home = tempfile::TempDir::new().unwrap();
-
-        // Override HOME so RadarStore::init() writes to temp dir
-        // (pipeline calls RadarStore::init internally)
-        unsafe {
-            std::env::set_var("HOME", tmp_home.path());
-        }
+        let lance_dir = tmp_home.path().join("lance");
 
         let pool = DbPool::test_pool().unwrap();
         let profile = Profile::new("pipeline-proof".into(), vec!["AI".into(), "safety".into()]);
@@ -531,14 +522,15 @@ mod tests {
         }
 
         let _job = pool.enqueue_job(&profile.id, None).unwrap();
-        let executor = PipelineExecutor::test_executor();
+        let executor = PipelineExecutor::test_executor()
+            .with_lance_store_path(&lance_dir);
         let run = executor.run_next(&pool).unwrap().unwrap();
 
         assert!(run.candidates >= 3);
         assert!(run.accepted >= 1, "at least one entry should be accepted");
 
         // Now query the findings surface
-        let store = crate::RadarStore::init().await.unwrap();
+        let store = crate::RadarStore::init_at(&lance_dir).await.unwrap();
         let findings = store.list_findings(100).await.unwrap();
         assert!(
             !findings.is_empty(),
@@ -1042,8 +1034,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn live_disk_handoff_pipeline_to_consumer() {
         let tmp_home = tempfile::TempDir::new().unwrap();
-        // Override HOME so both pipeline and consumer resolve to the same store
-        unsafe { std::env::set_var("HOME", tmp_home.path()); }
+        // Use an explicit LanceDB directory so both producer and consumer
+        // resolve to the same store without mutating the global HOME env var
+        // (which is unsafe under concurrent test execution).
+        let lance_dir = tmp_home.path().join("lance");
 
         let pool = DbPool::test_pool().unwrap();
         let profile = Profile::new(
@@ -1066,14 +1060,15 @@ mod tests {
             pool.insert_entry(&entry).unwrap();
         }
 
-        // Run pipeline (writes findings to disk-backed RadarStore via HOME)
+        // Run pipeline (writes findings to the explicit LanceDB directory)
         let _job = pool.enqueue_job(&profile.id, None).unwrap();
-        let executor = PipelineExecutor::test_executor();
+        let executor = PipelineExecutor::test_executor()
+            .with_lance_store_path(&lance_dir);
         let run = executor.run_next(&pool).unwrap().unwrap();
         assert!(run.accepted >= 1, "pipeline must accept at least 1 finding");
 
         // ── Consumer opens the SAME store independently ──
-        let consumer_store = crate::RadarStore::init().await.unwrap();
+        let consumer_store = crate::RadarStore::init_at(&lance_dir).await.unwrap();
         let all_findings = consumer_store.list_findings(100).await.unwrap();
         assert!(
             !all_findings.is_empty(),
@@ -1255,7 +1250,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn multi_cycle_soak_no_degradation() {
         let tmp_home = tempfile::TempDir::new().unwrap();
-        unsafe { std::env::set_var("HOME", tmp_home.path()); }
+        let lance_dir = tmp_home.path().join("lance");
 
         let pool = DbPool::test_pool().unwrap();
         let profile = Profile::new(
@@ -1279,7 +1274,8 @@ mod tests {
             pool.insert_entry(&entry).unwrap();
         }
 
-        let executor = PipelineExecutor::test_executor();
+        let executor = PipelineExecutor::test_executor()
+            .with_lance_store_path(&lance_dir);
         const SOAK_CYCLES: usize = 5;
 
         #[derive(Debug)]
@@ -1293,7 +1289,7 @@ mod tests {
         }
 
         let mut all_metrics: Vec<CycleMetrics> = Vec::new();
-        let store = crate::RadarStore::init().await.unwrap();
+        let store = crate::RadarStore::init_at(&lance_dir).await.unwrap();
 
         for cycle in 0..SOAK_CYCLES {
             let _job = pool.enqueue_job(&profile.id, None).unwrap();
@@ -1372,15 +1368,22 @@ mod tests {
             "no stuck running jobs after {SOAK_CYCLES} cycles"
         );
 
-        // 5. All completed jobs have non-zero progress
+        // 5. All jobs completed. With incremental scanning, only the first cycle
+        // has new candidates to score; subsequent cycles find no unscored
+        // entries (the fixed seed set was fully scored in cycle 0), so their
+        // progress is legitimately 0. The invariant is that every job completes
+        // — no stuck/failed jobs.
         let completed_jobs: Vec<_> = all_jobs
             .iter()
             .filter(|j| j.status == ScanJobStatus::Complete)
             .collect();
         assert_eq!(completed_jobs.len(), SOAK_CYCLES);
-        for j in &completed_jobs {
-            assert!(j.progress > 0, "completed job must have progress > 0");
-        }
+        // list_scan_jobs returns DESC order, so the last element is cycle 0
+        // (the first scan), which must have done real work.
+        assert!(
+            completed_jobs.last().unwrap().progress > 0,
+            "first cycle must score the seed entries"
+        );
 
         // Build soak report
         let report = serde_json::json!({
@@ -1466,6 +1469,8 @@ mod tests {
     /// jobs complete on retry, proving unattended reliability.
     #[test]
     fn soak_lease_reclaim_and_completion() {
+        let tmp_home = tempfile::TempDir::new().unwrap();
+        let lance_dir = tmp_home.path().join("lance");
         let pool = memory_pool();
         let profile = Profile::new(
             "soak-lease".into(),
@@ -1516,7 +1521,8 @@ mod tests {
         );
 
         // Now run all jobs to completion
-        let executor = PipelineExecutor::test_executor();
+        let executor = PipelineExecutor::test_executor()
+            .with_lance_store_path(&lance_dir);
         let mut completed = 0;
         for _ in 0..5 {
             // extra iterations to be safe
@@ -1687,7 +1693,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn evolve_consumer_batch_simulation_with_manifest() {
         let tmp_home = tempfile::TempDir::new().unwrap();
-        unsafe { std::env::set_var("HOME", tmp_home.path()); }
+        let lance_dir = tmp_home.path().join("lance");
 
         let pool = DbPool::test_pool().unwrap();
 
@@ -1726,7 +1732,8 @@ mod tests {
         }
 
         // Run pipeline for both profiles
-        let executor = PipelineExecutor::test_executor();
+        let executor = PipelineExecutor::test_executor()
+            .with_lance_store_path(&lance_dir);
         for profile in [&profile_rust, &profile_ml] {
             let _job = pool.enqueue_job(&profile.id, None).unwrap();
             let run = executor.run_next(&pool).unwrap().unwrap();
@@ -1734,7 +1741,7 @@ mod tests {
         }
 
         // ── Independent consumer opens the SAME store ──
-        let consumer_store = crate::RadarStore::init().await.unwrap();
+        let consumer_store = crate::RadarStore::init_at(&lance_dir).await.unwrap();
         let all_findings = consumer_store.list_findings(1000).await.unwrap();
         assert!(
             !all_findings.is_empty(),
@@ -1898,7 +1905,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn extended_soak_with_observability_artifact() {
         let tmp_home = tempfile::TempDir::new().unwrap();
-        unsafe { std::env::set_var("HOME", tmp_home.path()); }
+        let lance_dir = tmp_home.path().join("lance");
 
         let pool = DbPool::test_pool().unwrap();
         let profile = Profile::new(
@@ -1922,8 +1929,9 @@ mod tests {
             pool.insert_entry(&entry).unwrap();
         }
 
-        let executor = PipelineExecutor::test_executor();
-        let store = crate::RadarStore::init().await.unwrap();
+        let executor = PipelineExecutor::test_executor()
+            .with_lance_store_path(&lance_dir);
+        let store = crate::RadarStore::init_at(&lance_dir).await.unwrap();
         const SOAK_CYCLES: usize = 10;
         const FAILURE_INJECTION_CYCLE: usize = 4;
 
@@ -2079,7 +2087,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn readiness_gate_artifact() {
         let tmp_home = tempfile::TempDir::new().unwrap();
-        unsafe { std::env::set_var("HOME", tmp_home.path()); }
+        let lance_dir = tmp_home.path().join("lance");
 
         let pool = DbPool::test_pool().unwrap();
 
@@ -2135,12 +2143,13 @@ mod tests {
         let entry2 = Entry::new(src2.id.clone(), "rust safety performance research".into());
         pool.insert_entry(&entry2).unwrap();
         let _job2 = pool.enqueue_job(&profile.id, None).unwrap();
-        let executor = PipelineExecutor::test_executor();
+        let executor = PipelineExecutor::test_executor()
+            .with_lance_store_path(&lance_dir);
         let run = executor.run_next(&pool).unwrap().unwrap();
         let pipeline_ok = run.candidates >= 1;
 
         // ── 8. LanceDB findings roundtrip ──
-        let store = crate::RadarStore::init().await.unwrap();
+        let store = crate::RadarStore::init_at(&lance_dir).await.unwrap();
         let findings = store.list_findings(100).await.unwrap();
         let lance_ok = !findings.is_empty();
 

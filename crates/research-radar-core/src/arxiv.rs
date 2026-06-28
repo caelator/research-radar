@@ -53,7 +53,7 @@ pub async fn fetch_arxiv_papers(
         max_results.min(100) // arXiv caps at 100 per request
     );
 
-    let client = reqwest::Client::new();
+    let client = crate::http_client().map_err(|e| ArxivError::Http(e.to_string()))?;
     let resp = client
         .get(&url)
         .header(

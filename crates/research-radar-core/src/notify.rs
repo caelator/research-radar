@@ -62,7 +62,7 @@ pub async fn notify_discord(
     matches: &[ScoredMatch],
     webhook_url: &str,
 ) -> Result<NotifyResult, NotifyError> {
-    let client = reqwest::Client::new();
+    let client = crate::http_client().map_err(|e| NotifyError::Http(e.to_string()))?;
     let mut result = NotifyResult {
         sent: 0,
         skipped: 0,
@@ -203,15 +203,25 @@ pub async fn notify_discord(
     Ok(result)
 }
 
+/// Truncate `s` to at most `max` bytes, appending "..." if truncated.
+///
+/// Safe for multi-byte UTF-8: never slices inside a code point. Prefers to cut
+/// at a word boundary when one falls within the window, otherwise cuts at the
+/// nearest char boundary at or before the byte limit.
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
-        s.to_string()
-    } else {
-        let cut = s[..max.saturating_sub(3)]
-            .rfind(' ')
-            .unwrap_or(max.saturating_sub(3));
-        format!("{}...", &s[..cut])
+        return s.to_string();
     }
+    // Reserve room for the ellipsis.
+    let limit = max.saturating_sub(3);
+    // Walk back to a char boundary at or below `limit`.
+    let mut boundary = limit;
+    while !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    // Prefer to cut at the last space within the window for readability.
+    let cut = s[..boundary].rfind(' ').unwrap_or(boundary);
+    format!("{}...", &s[..cut])
 }
 
 #[cfg(test)]
@@ -229,6 +239,26 @@ mod tests {
         let result = truncate(&long, 50);
         assert!(result.len() <= 50);
         assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_multibyte_utf8_does_not_panic() {
+        // Accented characters (2 bytes each in UTF-8). A naive byte slice
+        // would land mid-codepoint and panic.
+        let s = "aaéééééééééééé end";
+        let result = truncate(s, 10);
+        assert!(result.ends_with("..."));
+        // Result must be valid UTF-8 and within the byte budget.
+        assert!(result.len() <= 10);
+    }
+
+    #[test]
+    fn truncate_cjk_does_not_panic() {
+        // CJK characters are 3 bytes each.
+        let s: String = "中".repeat(50);
+        let result = truncate(&s, 10);
+        assert!(result.ends_with("..."));
+        assert!(result.len() <= 10);
     }
 
     #[test]

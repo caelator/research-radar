@@ -57,7 +57,7 @@ impl AnthropicBackend {
         Self {
             api_key,
             model: "claude-sonnet-4-20250514".to_string(),
-            client: reqwest::Client::new(),
+            client: crate::http_client().unwrap_or_else(|_| reqwest::Client::new()),
             base_url: "https://api.anthropic.com".to_string(),
         }
     }
@@ -253,13 +253,21 @@ impl LlmBackend for MockBackend {
     }
 }
 
+/// Truncate `s` to at most `max` bytes.
+///
+/// Safe for multi-byte UTF-8: never slices inside a code point.
 fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max {
-        s
-    } else {
-        let end = s[..max].rfind(' ').unwrap_or(max);
-        &s[..end]
+        return s;
     }
+    // Walk back to a char boundary at or below `max`.
+    let mut boundary = max;
+    while !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    // Prefer to cut at the last space within the window.
+    let end = s[..boundary].rfind(' ').unwrap_or(boundary);
+    &s[..end]
 }
 
 #[cfg(test)]
@@ -442,6 +450,22 @@ mod tests {
         assert!(result.len() <= 15);
         // Should cut at a word boundary
         assert!(!result.ends_with(' '));
+    }
+
+    #[test]
+    fn truncate_multibyte_utf8_safe() {
+        // 2-byte chars: naive byte slicing would panic mid-codepoint.
+        let s = "aaéééééééééééé end";
+        let result = truncate(s, 10);
+        assert!(result.len() <= 10);
+        // Must be valid UTF-8 (implicit in &str return type).
+    }
+
+    #[test]
+    fn truncate_cjk_safe() {
+        let s: String = "中".repeat(50);
+        let result = truncate(&s, 10);
+        assert!(result.len() <= 10);
     }
 
     #[test]

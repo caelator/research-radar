@@ -385,6 +385,24 @@ mod sqlite {
             }
         }
 
+
+        /// List entries that have not yet been scored for the given profile.
+        ///
+        /// This is the incremental-scan primitive: each scan only processes
+        /// entries that are new since the last scan for this profile, instead
+        /// of re-scoring the entire corpus every time.
+        pub fn list_unscored_entries(&self, profile_id: &str, limit: usize) -> Result<Vec<crate::Entry>> {
+            let mut stmt = self.conn.prepare(
+                "SELECT e.id, e.source_id, e.content, e.summary, e.tags, e.relevance_score, e.last_reread_at                  FROM entries e                  WHERE NOT EXISTS (SELECT 1 FROM item_scores i WHERE i.entry_id = e.id AND i.profile_id = ?1)                  ORDER BY e.rowid DESC LIMIT ?2",
+            )?;
+            let mut entries = Vec::new();
+            let mut rows = stmt.query(params![profile_id, limit as i64])?;
+            while let Some(row) = rows.next()? {
+                entries.push(Self::row_to_entry(row)?);
+            }
+            Ok(entries)
+        }
+
         /// Fetch sources by their IDs.
         pub fn list_sources_by_ids(&self, ids: &[String]) -> Result<Vec<crate::Source>> {
             if ids.is_empty() {
@@ -1764,10 +1782,19 @@ pub mod lance_store {
         /// Open (or create) the LanceDB store at `~/.research-radar/lance/`.
         pub async fn init() -> Result<Self> {
             let db_path = Self::db_path()?;
-            if let Some(parent) = db_path.parent() {
+            Self::init_at(&db_path).await
+        }
+
+        /// Open (or create) the LanceDB store at an explicit directory.
+        ///
+        /// This avoids reading the process-global `HOME` env var, which is
+        /// unsafe to mutate from concurrent tests. Use this in tests instead
+        /// of `init()`.
+        pub async fn init_at(dir: &std::path::Path) -> Result<Self> {
+            if let Some(parent) = dir.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let uri = db_path.to_str().ok_or_else(|| {
+            let uri = dir.to_str().ok_or_else(|| {
                 LanceError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "db path is not valid UTF-8",

@@ -367,6 +367,22 @@ impl ItemAlias {
     }
 }
 
+// ─── HTTP client ──────────────────────────────────────────────────────
+
+/// Build a `reqwest::Client` with sane defaults: a 30-second timeout and
+/// connection pooling (keep-alive) enabled.
+///
+/// The three source adapters and the scorer call this instead of
+/// `reqwest::Client::new()` so that slow or hung upstreams cannot stall the
+/// pipeline indefinitely, and so connections are reused across calls.
+pub fn http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .build()
+}
+
 // ─── Re-exports ──────────────────────────────────────────────────────
 
 pub mod arxiv;

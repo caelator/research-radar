@@ -44,8 +44,13 @@ pub struct PipelineRun {
 pub struct PipelineExecutor {
     scorer: Arc<dyn LlmBackend>,
     discord_webhook_url: Option<String>,
-    /// If true, skips external API calls (arXiv, Semantic Scholar) in tests.
+    /// If true, skips external API calls (arXiv, Semantic Scholar, OpenAlex).
+    /// Set by `test_executor()` and by callers that want an offline run.
     disable_external_fetches: bool,
+    /// Optional explicit LanceDB directory. When set, `persist_findings`
+    /// writes here instead of resolving `~/.research-radar/lance` from the
+    /// process-global `HOME` env var. Used by tests to avoid env-var races.
+    lance_store_path: Option<std::path::PathBuf>,
 }
 
 impl Default for PipelineExecutor {
@@ -60,17 +65,32 @@ impl PipelineExecutor {
             scorer: Arc::new(MockBackend),
             discord_webhook_url: None,
             disable_external_fetches: false,
+            lance_store_path: None,
         }
     }
 
-    /// Create an executor for tests that should not make external API calls.
-    #[cfg(test)]
+    /// Create an executor that does not make external API calls.
+    ///
+    /// All fetch stages (arXiv, Semantic Scholar, OpenAlex) are skipped — the
+    /// pipeline only processes pre-existing entries in the database. This is
+    /// used by tests and by callers that want an offline run.
     pub fn test_executor() -> Self {
         Self {
             scorer: Arc::new(MockBackend),
             discord_webhook_url: None,
             disable_external_fetches: true,
+            lance_store_path: None,
         }
+    }
+
+    /// Set an explicit LanceDB directory for `persist_findings` (tests only).
+    ///
+    /// Avoids mutating the process-global `HOME` env var, which is unsafe
+    /// under concurrent test execution.
+    #[cfg(test)]
+    pub fn with_lance_store_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.lance_store_path = Some(path.into());
+        self
     }
 
     pub fn with_scorer(scorer: Arc<dyn LlmBackend>) -> Self {
@@ -78,11 +98,19 @@ impl PipelineExecutor {
             scorer,
             discord_webhook_url: None,
             disable_external_fetches: false,
+            lance_store_path: None,
         }
     }
 
     pub fn with_discord_webhook_url(mut self, url: Option<String>) -> Self {
         self.discord_webhook_url = url;
+        self
+    }
+
+    /// Override the scorer on an existing executor (e.g. a `test_executor`).
+    /// Keeps all other settings (such as `disable_external_fetches`) intact.
+    pub fn with_scorer_override(mut self, scorer: Arc<dyn LlmBackend>) -> Self {
+        self.scorer = scorer;
         self
     }
 
@@ -199,12 +227,15 @@ impl PipelineExecutor {
         let ranked = self.rank_candidates(&profile, candidates);
         self.heartbeat(pool, job);
 
-        // Stage 5: LLM score the top candidates (bounded by max_llm_calls)
-        let scored = self.llm_score(&profile, &ranked);
+        // Stage 5: LLM score the top candidates (bounded by max_llm_calls),
+        // then merge the refined scores back into `ranked` so every downstream
+        // stage (persist, findings, notify) uses the best-available score.
+        let llm_results = self.llm_score(&profile, &ranked);
+        let ranked = self.merge_llm_scores(ranked, &llm_results, &profile);
         self.heartbeat(pool, job);
 
         // Stage 6: Persist scores
-        let accepted = self.persist_scores(pool, &profile, &ranked, &scored)?;
+        let accepted = self.persist_scores(pool, &profile, &ranked)?;
 
         // Stage 7: Persist findings to LanceDB
         self.persist_findings(pool, &profile, &ranked)?;
@@ -257,7 +288,6 @@ impl PipelineExecutor {
             return 0;
         }
 
-        #[cfg(test)]
         if self.disable_external_fetches {
             return 0;
         }
@@ -383,7 +413,6 @@ impl PipelineExecutor {
             return 0;
         }
 
-        #[cfg(test)]
         if self.disable_external_fetches {
             return 0;
         }
@@ -544,7 +573,6 @@ impl PipelineExecutor {
             return 0;
         }
 
-        #[cfg(test)]
         if self.disable_external_fetches {
             return 0;
         }
@@ -692,18 +720,27 @@ impl PipelineExecutor {
         inserted
     }
 
+    /// Maximum number of candidate entries to evaluate per scan.
+    ///
+    /// Bounds the work done in a single scan so that a large historical corpus
+    /// doesn't make each scan O(corpus). Newly-fetched entries are prioritized
+    /// (they have the highest rowid).
+    const MAX_CANDIDATES_PER_SCAN: usize = 500;
+
     fn fetch_candidates(
         &self,
         pool: &DbPool,
         profile: &Profile,
     ) -> Result<Vec<Entry>, StorageError> {
-        // Ensure all sources have at least one entry
+        // Ensure sources without entries get a placeholder entry so they can be
+        // scored. When the profile lists explicit sources, only those are
+        // considered; otherwise all sources are considered (user-added sources
+        // should not be silently skipped on first scan).
         let sources = if profile.sources.is_empty() {
             pool.list_sources(pool.count_sources()?)?
         } else {
             pool.list_sources_by_ids(&profile.sources)?
         };
-
         for source in &sources {
             let source_entries = pool.list_entries(Some(&[source.id.clone()]))?;
             if source_entries.is_empty() {
@@ -714,13 +751,9 @@ impl PipelineExecutor {
             }
         }
 
-        // Now gather all entries
-        let entries = if profile.sources.is_empty() {
-            pool.list_entries(None)?
-        } else {
-            pool.list_entries(Some(&profile.sources))?
-        };
-
+        // Incremental scan: only gather entries not yet scored for this profile.
+        // This makes each scan O(new entries) instead of O(total corpus).
+        let entries = pool.list_unscored_entries(&profile.id, Self::MAX_CANDIDATES_PER_SCAN)?;
         Ok(entries)
     }
 
@@ -754,7 +787,16 @@ impl PipelineExecutor {
     }
 
     /// Run LLM scoring on the top keyword-matched candidates.
-    fn llm_score(&self, profile: &Profile, ranked: &[ScoredMatch]) -> Vec<ScorerResult> {
+    ///
+    /// Returns a map keyed by entry_id so that `persist_scores` can look up the
+    /// refined LLM score for each candidate. Only the top candidates above the
+    /// keyword-score threshold are sent to the (expensive) LLM, bounded by
+    /// `max_llm_calls`.
+    fn llm_score(
+        &self,
+        profile: &Profile,
+        ranked: &[ScoredMatch],
+    ) -> std::collections::HashMap<String, ScorerResult> {
         let above_threshold: Vec<&ScoredMatch> = ranked
             .iter()
             .filter(|m| m.score >= profile.score_threshold)
@@ -762,21 +804,27 @@ impl PipelineExecutor {
             .collect();
 
         if above_threshold.is_empty() {
-            return Vec::new();
+            return std::collections::HashMap::new();
         }
 
-        let mut results = Vec::new();
+        let mut results = std::collections::HashMap::with_capacity(above_threshold.len());
         for scored in above_threshold {
             match tokio_block_on(self.scorer.score(&scored.entry, profile)) {
-                Ok(result) => results.push(result),
+                Ok(result) => {
+                    results.insert(scored.entry.id.clone(), result);
+                }
                 Err(e) => {
                     tracing::warn!("LLM scoring failed for entry {}: {e}", scored.entry.id);
-                    results.push(ScorerResult {
-                        score: scored.score,
-                        reason: format!("LLM scoring failed: {e}"),
-                        rationale: String::new(),
-                        disposition: "llm_failed".to_string(),
-                    });
+                    // Fall back to the keyword score so the entry is still scored.
+                    results.insert(
+                        scored.entry.id.clone(),
+                        ScorerResult {
+                            score: scored.score,
+                            reason: format!("LLM scoring failed: {e}"),
+                            rationale: String::new(),
+                            disposition: "llm_failed".to_string(),
+                        },
+                    );
                 }
             }
         }
@@ -788,10 +836,16 @@ impl PipelineExecutor {
         pool: &DbPool,
         profile: &Profile,
         ranked: &[ScoredMatch],
-        _llm_results: &[ScorerResult],
     ) -> Result<usize, StorageError> {
         let mut accepted = 0;
         for scored in ranked {
+            // Skip entries with a zero score — they have no signal and don't
+            // need a row in item_scores. This avoids redundant writes for the
+            // (typically large) tail of irrelevant candidates.
+            if scored.score == 0.0 {
+                continue;
+            }
+
             pool.upsert_item_score(
                 &scored.entry.id,
                 &profile.id,
@@ -804,6 +858,32 @@ impl PipelineExecutor {
             }
         }
         Ok(accepted)
+    }
+
+    /// Merge LLM-refined scores back into the ranked candidates.
+    ///
+    /// For each candidate that received an LLM score, replace its keyword score
+    /// with the LLM score and update its disposition. Candidates not sent to the
+    /// LLM keep their keyword score. The result is re-sorted by final score.
+    fn merge_llm_scores(
+        &self,
+        mut ranked: Vec<ScoredMatch>,
+        llm_results: &std::collections::HashMap<String, ScorerResult>,
+        profile: &Profile,
+    ) -> Vec<ScoredMatch> {
+        for sm in ranked.iter_mut() {
+            if let Some(llm) = llm_results.get(&sm.entry.id) {
+                sm.score = llm.score;
+                sm.disposition = if llm.score >= profile.score_threshold {
+                    "matched"
+                } else {
+                    "scored_below_threshold"
+                }
+                .to_string();
+            }
+        }
+        ranked.sort_by(|a, b| b.score.total_cmp(&a.score));
+        ranked
     }
 
     fn persist_findings(
@@ -820,8 +900,13 @@ impl PipelineExecutor {
             return Ok(());
         }
 
-        let store = tokio_block_on(RadarStore::init())
-            .map_err(|err| StorageError::Io(std::io::Error::other(err.to_string())))?;
+        let store = tokio_block_on(async {
+            match &self.lance_store_path {
+                Some(path) => RadarStore::init_at(path).await,
+                None => RadarStore::init().await,
+            }
+        })
+        .map_err(|err| StorageError::Io(std::io::Error::other(err.to_string())))?;
 
         for scored in accepted {
             let source = pool.get_source(&scored.entry.source_id)?.ok_or_else(|| {
@@ -1015,5 +1100,146 @@ mod tests {
         let notified = pool.get_notified_items(&profile.id, "discord").unwrap();
         assert!(notified.contains("item1"));
         assert_eq!(notified.len(), 1);
+    }
+
+    /// Incremental scanning: a second scan over the same entries must not
+    /// re-score them. The candidate count of the second run should be 0.
+    #[test]
+    fn incremental_scan_skips_already_scored_entries() {
+        let pool = DbPool::test_pool().unwrap();
+        let profile = Profile::new("AI".into(), vec!["AI".into()]);
+        pool.insert_profile(&profile).unwrap();
+
+        let source = Source::new(
+            "https://example.com/incr".into(),
+            "AI Research".into(),
+            SourceType::Paper,
+        );
+        pool.insert_source(&source).unwrap();
+        let entry = Entry::new(source.id.clone(), "AI alignment research".into());
+        pool.insert_entry(&entry).unwrap();
+
+        let executor = PipelineExecutor::test_executor();
+
+        // First scan: should find and score the entry.
+        let _job1 = pool.enqueue_job(&profile.id, None).unwrap();
+        let run1 = executor.run_next(&pool).unwrap().unwrap();
+        assert!(run1.candidates >= 1, "first scan must find the entry");
+        assert!(run1.accepted >= 1, "first scan must accept the entry");
+
+        // Second scan: no new entries → zero candidates.
+        let _job2 = pool.enqueue_job(&profile.id, None).unwrap();
+        let run2 = executor.run_next(&pool).unwrap().unwrap();
+        assert_eq!(
+            run2.candidates, 0,
+            "second scan must not re-score already-scored entries"
+        );
+        assert_eq!(run2.accepted, 0);
+    }
+
+    /// Zero-score entries must not get a row in item_scores.
+    #[test]
+    fn zero_score_entries_are_not_persisted() {
+        let pool = DbPool::test_pool().unwrap();
+        let profile = Profile::new("Rust".into(), vec!["rust".into()]);
+        pool.insert_profile(&profile).unwrap();
+
+        // An entry that matches keywords.
+        let src_match = Source::new(
+            "https://example.com/match".into(),
+            "Rust Safety".into(),
+            SourceType::Paper,
+        );
+        pool.insert_source(&src_match).unwrap();
+        pool.insert_entry(&Entry::new(
+            src_match.id.clone(),
+            "rust memory safety".into(),
+        ))
+        .unwrap();
+
+        // An entry that does NOT match any keyword.
+        let src_no = Source::new(
+            "https://example.com/nomatch".into(),
+            "Gardening".into(),
+            SourceType::Article,
+        );
+        pool.insert_source(&src_no).unwrap();
+        pool.insert_entry(&Entry::new(src_no.id.clone(), "tomato growing tips".into()))
+            .unwrap();
+
+        let _job = pool.enqueue_job(&profile.id, None).unwrap();
+        let executor = PipelineExecutor::test_executor();
+        let _run = executor.run_next(&pool).unwrap().unwrap();
+
+        // Only the matching entry should be in item_scores.
+        let items = pool
+            .get_items_by_profile(&profile.id, None, None, 100, 0)
+            .unwrap();
+        assert_eq!(items.len(), 1, "only matching entry should be scored");
+        assert!(items[0].entry.content.contains("rust"));
+    }
+
+    /// LLM scores must override keyword scores in the persisted result.
+    #[test]
+    fn llm_score_overrides_keyword_score() {
+        use crate::scorer::{LlmBackend, ScorerError, ScorerResult};
+        use async_trait::async_trait;
+
+        /// A mock LLM backend that always returns a fixed high score,
+        /// regardless of keyword overlap.
+        struct HighScoreBackend;
+
+        #[async_trait]
+        impl LlmBackend for HighScoreBackend {
+            async fn score(
+                &self,
+                _entry: &Entry,
+                _profile: &Profile,
+            ) -> Result<ScorerResult, ScorerError> {
+                Ok(ScorerResult {
+                    score: 0.99,
+                    reason: "LLM override".into(),
+                    rationale: "mock".into(),
+                    disposition: "matched".into(),
+                })
+            }
+        }
+
+        let pool = DbPool::test_pool().unwrap();
+        // Use a threshold above the keyword score but below the LLM score.
+        let mut profile = Profile::new("Test".into(), vec!["AI".into()]);
+        profile.score_threshold = 0.8;
+        profile.max_llm_calls = 10;
+        pool.insert_profile(&profile).unwrap();
+
+        let source = Source::new(
+            "https://example.com/llm".into(),
+            "AI Paper".into(),
+            SourceType::Paper,
+        );
+        pool.insert_source(&source).unwrap();
+        // Keyword score for single keyword "AI" = 1.0, but we verify the LLM
+        // score (0.99) is what gets persisted, not some other value.
+        pool.insert_entry(&Entry::new(source.id.clone(), "AI research".into()))
+            .unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let executor = PipelineExecutor::test_executor()
+            .with_scorer_override(Arc::new(HighScoreBackend))
+            .with_lance_store_path(tmp.path().join("lance"));
+        let _job = pool.enqueue_job(&profile.id, None).unwrap();
+        let _run = executor.run_next(&pool).unwrap().unwrap();
+        assert!(_run.accepted >= 1);
+
+        let items = pool
+            .get_items_by_profile(&profile.id, None, None, 100, 0)
+            .unwrap();
+        assert!(!items.is_empty());
+        // The persisted score must be the LLM score, not the keyword score.
+        assert!(
+            (items[0].score - 0.99).abs() < 0.001,
+            "LLM score (0.99) must be persisted, got {}",
+            items[0].score
+        );
     }
 }
