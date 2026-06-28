@@ -15,8 +15,8 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use research_radar_core::{
-    AnthropicBackend, DbPool, PipelineExecutor, Profile, RadarQuery, RadarResult, Source,
-    SourceType,
+    AnthropicBackend, DbPool, PipelineExecutor, Profile, RadarQuery, RadarResult, RadarStore,
+    Source, SourceType,
 };
 use std::sync::Arc;
 
@@ -88,6 +88,21 @@ enum Commands {
 
     /// Start the MCP JSON-RPC server (stdio).
     Mcp,
+
+    /// Export actionable findings to a JSON file (for self-harness integration).
+    ExportFindings {
+        /// Output file path (default: stdout).
+        #[arg(short, long)]
+        out: Option<String>,
+
+        /// Maximum number of findings to export (default: 20).
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+
+        /// Minimum confidence threshold (default: 0.0 = no filter).
+        #[arg(long, default_value = "0.0")]
+        min_confidence: f64,
+    },
 }
 
 #[derive(Parser)]
@@ -469,7 +484,79 @@ fn main() {
                 std::process::exit(1);
             }
         }
+
+        Commands::ExportFindings {
+            out,
+            limit,
+            min_confidence,
+        } => {
+            let findings_json = match export_findings(limit, min_confidence) {
+                Ok(json) => json,
+                Err(e) => {
+                    eprintln!("error: failed to export findings: {e}");
+                    std::process::exit(1);
+                }
+            };
+            match &out {
+                Some(path) => match std::fs::write(path, &findings_json) {
+                    Ok(()) => eprintln!("exported findings to {path}"),
+                    Err(e) => {
+                        eprintln!("error: failed to write output file: {e}");
+                        std::process::exit(1);
+                    }
+                },
+                None => println!("{findings_json}"),
+            }
+        }
     }
+}
+
+/// Export actionable findings as a JSON array for external consumers
+/// (e.g. self-harness memory sources).
+fn export_findings(
+
+    limit: usize,
+    min_confidence: f64,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let store = tokio_block_on(RadarStore::init())?;
+    let findings = tokio_block_on(store.list_actionable_findings(limit))?;
+
+    let filtered: Vec<_> = findings
+        .into_iter()
+        .filter(|f| f.confidence as f64 >= min_confidence)
+        .map(|f| {
+            serde_json::json!({
+                "id": f.id,
+                "title": f.title,
+                "summary": f.summary,
+                "source_url": f.source_url,
+                "source_title": f.source_title,
+                "source_type": f.source_type.as_str(),
+                "domain": f.domain,
+                "confidence": f.confidence,
+                "urgency": f.urgency.as_str(),
+                "suggested_action": f.suggested_action,
+                "novelty_score": f.novelty_score,
+                "applicability_hypothesis": f.applicability_hypothesis,
+                "discovered_at": f.discovered_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "source": "research-radar",
+        "exported_at": chrono::Utc::now().to_rfc3339(),
+        "count": filtered.len(),
+        "findings": filtered,
+    }))?)
+}
+
+fn tokio_block_on<F: std::future::Future>(fut: F) -> F::Output {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(fut)
 }
 
 fn build_executor() -> PipelineExecutor {
