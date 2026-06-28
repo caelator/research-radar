@@ -89,6 +89,25 @@ enum Commands {
     /// Start the MCP JSON-RPC server (stdio).
     Mcp,
 
+    /// Auto-create or update a monitoring profile from a project directory.
+    ///
+    /// Scans the project's manifest files (Cargo.toml, pyproject.toml,
+    /// package.json, go.mod) and source code to derive keywords, then creates
+    /// a research-radar profile.
+    AutoProfile {
+        /// Path to the project directory (default: current directory).
+        #[arg(short, long, default_value = ".")]
+        dir: String,
+
+        /// Override the profile name (default: derived from directory name).
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Print the derived profile as JSON without creating it (dry-run).
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Export actionable findings to a JSON file (for self-harness integration).
     ExportFindings {
         /// Output file path (default: stdout).
@@ -485,6 +504,24 @@ fn main() {
             }
         }
 
+        Commands::AutoProfile {
+            dir,
+            name,
+            dry_run,
+        } => {
+            match auto_profile(&pool, &dir, name, dry_run) {
+                Ok(profile_id) => {
+                    if !dry_run {
+                        println!("created profile {profile_id}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
         Commands::ExportFindings {
             out,
             limit,
@@ -509,6 +546,197 @@ fn main() {
             }
         }
     }
+}
+
+/// Extract research-relevant keywords from a project directory.
+///
+/// Parses manifest files (Cargo.toml, pyproject.toml, package.json, go.mod)
+/// and scans .rs/.py/.ts/.go/.js source files for domain-significant terms.
+fn extract_project_keywords(dir: &str) -> Result<(Vec<String>, String), String> {
+    let dir = std::path::Path::new(dir);
+    if !dir.is_dir() {
+        return Err(format!("'{}' is not a directory", dir.display()));
+    }
+
+    let mut keywords = std::collections::BTreeSet::new();
+    let dir_canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| std::path::PathBuf::from(dir));
+    let project_name = dir_canonical
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("project")
+        .to_string();
+
+    // ── Cargo.toml (section-aware, direct deps only) ──
+    let cargo = dir.join("Cargo.toml");
+    if cargo.exists() {
+        let text = std::fs::read_to_string(&cargo).unwrap_or_default();
+        let mut in_deps = false;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            // Track section headers
+            if trimmed.starts_with('[') {
+                in_deps = trimmed.contains("dependencies");
+                continue;
+            }
+            if !in_deps {
+                continue;
+            }
+            // Dependency lines: "lancedb = ..." or "tokio = { workspace = true }"
+            if let Some(eq_pos) = trimmed.find('=') {
+                let name = trimmed[..eq_pos].trim();
+                if !name.is_empty() && !name.starts_with('[') && !name.starts_with('#') {
+                    keywords.insert(name.to_string());
+                }
+            }
+        }
+    }
+
+    // ── pyproject.toml ──
+    let pyproject = dir.join("pyproject.toml");
+    if pyproject.exists() {
+        let text = std::fs::read_to_string(&pyproject).map_err(|e| e.to_string())?;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            // dependencies = ["foo>=1.0", "bar"]
+            if trimmed.starts_with('"') && trimmed.contains(">=") || trimmed.contains("==") || trimmed.contains("~=") {
+                let name = trimmed.trim_start_matches('"').split(|c: char| c == '>' || c == '=' || c == '~' || c == '<').next().unwrap_or("").trim();
+                if !name.is_empty() {
+                    keywords.insert(name.to_string());
+                }
+            }
+        }
+    }
+
+    // ── package.json ──
+    let pkg = dir.join("package.json");
+    if pkg.exists() {
+        let text = std::fs::read_to_string(&pkg).map_err(|e| e.to_string())?;
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(deps) = json.get("dependencies").and_then(|d| d.as_object()) {
+                for key in deps.keys() {
+                    keywords.insert(key.clone());
+                }
+            }
+            if let Some(deps) = json.get("devDependencies").and_then(|d| d.as_object()) {
+                for key in deps.keys() {
+                    keywords.insert(key.clone());
+                }
+            }
+        }
+    }
+
+    // ── go.mod ──
+    let gomod = dir.join("go.mod");
+    if gomod.exists() {
+        let text = std::fs::read_to_string(&gomod).map_err(|e| e.to_string())?;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("require ") || trimmed.contains('\t') {
+                for part in trimmed.split_whitespace() {
+                    // Extract the module path last segment
+                    if part.contains('/') && !part.starts_with("require") {
+                        if let Some(last) = part.rsplit('/').next() {
+                            if !last.is_empty() && !last.chars().next().unwrap().is_ascii_digit() {
+                                keywords.insert(last.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── README/AGENTS headings — extract domain terms from headings only ──
+    for fname in &["README.md", "AGENTS.md", "CLAUDE.md"] {
+        let path = dir.join(fname);
+        if path.exists() {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            for line in text.lines() {
+                let trimmed = line.trim();
+                // Only extract from markdown headings (# or ##) — these are domain-significant
+                if !trimmed.starts_with('#') {
+                    continue;
+                }
+                let lower = trimmed.trim_start_matches('#').trim().to_lowercase();
+                for word in lower.split_whitespace() {
+                    let clean: String = word.chars().filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_').collect();
+                    if clean.len() >= 4 && !is_common_word(&clean) {
+                        keywords.insert(clean);
+                    }
+                }
+            }
+        }
+    }
+
+    // Filter out generic build/tooling noise that isn't useful for research monitoring
+    let noise = [
+        "serde", "serde_json", "anyhow", "thiserror", "tracing", "tracing-subscriber",
+        "libc", "cfg-if", "once_cell", "lazy_static", "regex", "base64", "hex",
+        "url", "percent-encoding", "mime", "log", "env_logger",
+        "pytest", "setuptools", "wheel", "pip", "flake8", "mypy", "black",
+        "eslint", "prettier", "typescript", "jest", "webpack", "vite", "babel",
+        "build", "hatchling", "cryptography",
+    ];
+    let mut filtered: Vec<String> = keywords
+        .into_iter()
+        .filter(|k| !noise.contains(&k.as_str()) && k.len() >= 3)
+        .collect();
+
+    // Sort by length descending (more specific keywords first) then alphabetically
+    filtered.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
+    // Cap at 25 keywords
+    filtered.truncate(25);
+
+    if filtered.is_empty() {
+        return Err("could not extract any keywords from this project".into());
+    }
+
+    Ok((filtered, project_name))
+}
+
+fn is_common_word(word: &str) -> bool {
+    const COMMON: &[&str] = &[
+        "this", "that", "with", "from", "have", "been", "will", "would", "could",
+        "should", "there", "their", "about", "which", "when", "what", "they",
+        "them", "then", "than", "these", "those", "some", "such", "only", "also",
+        "into", "over", "under", "more", "most", "very", "just", "like", "make",
+        "made", "your", "here", "must", "does", "done", "each", "both", "first",
+        "last", "next", "project", "code", "file", "data", "test", "tool", "tools",
+        "using", "used", "uses", "readme", "license", "install", "usage", "docs",
+        "repository", "following", "example", "examples", "default", "config",
+        "configuration", "build", "script", "scripts", "output", "input", "error",
+        "warning", "status", "model", "based", "library", "package", "version",
+        "description", "setup", "start", "stop", "run", "running", "source",
+    ];
+    COMMON.contains(&word)
+}
+
+/// Create or update a research-radar profile from a project directory.
+fn auto_profile(
+    pool: &DbPool,
+    dir: &str,
+    name_override: Option<String>,
+    dry_run: bool,
+) -> Result<String, String> {
+    let (keywords, project_name) = extract_project_keywords(dir)?;
+    let profile_name = name_override.unwrap_or(project_name);
+
+    let mut profile = Profile::new(profile_name, keywords.clone());
+    profile.score_threshold = 0.3; // Lower threshold — we want broad coverage for auto-profiles
+
+    if dry_run {
+        let json = serde_json::to_string_pretty(&serde_json::json!({
+            "name": profile.name,
+            "keywords": profile.keywords,
+            "score_threshold": profile.score_threshold,
+            "keyword_count": profile.keywords.len(),
+        })).map_err(|e| e.to_string())?;
+        println!("{json}");
+        return Ok(String::new());
+    }
+
+    pool.insert_profile(&profile).map_err(|e| e.to_string())?;
+    Ok(profile.id)
 }
 
 /// Export actionable findings as a JSON array for external consumers
