@@ -21,6 +21,7 @@ pub struct WorkerHealthSnapshot {
     pub started_at: String,
     pub last_poll_at: Option<String>,
     pub last_job_completed_at: Option<String>,
+    pub last_feedback_poll: Option<research_radar_core::feedback::PollSummary>,
     pub jobs_completed: u64,
     pub jobs_failed: u64,
     pub jobs_dead_lettered: u64,
@@ -34,6 +35,7 @@ struct WorkerHealth {
     started_at: chrono::DateTime<chrono::Utc>,
     last_poll_at: Option<chrono::DateTime<chrono::Utc>>,
     last_job_completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_feedback_poll: Option<research_radar_core::feedback::PollSummary>,
     jobs_completed: u64,
     jobs_failed: u64,
     jobs_dead_lettered: u64,
@@ -47,6 +49,7 @@ impl WorkerHealth {
             started_at: chrono::Utc::now(),
             last_poll_at: None,
             last_job_completed_at: None,
+            last_feedback_poll: None,
             jobs_completed: 0,
             jobs_failed: 0,
             jobs_dead_lettered: 0,
@@ -61,6 +64,7 @@ impl WorkerHealth {
             started_at: self.started_at.to_rfc3339(),
             last_poll_at: self.last_poll_at.map(|dt| dt.to_rfc3339()),
             last_job_completed_at: self.last_job_completed_at.map(|dt| dt.to_rfc3339()),
+            last_feedback_poll: self.last_feedback_poll.clone(),
             jobs_completed: self.jobs_completed,
             jobs_failed: self.jobs_failed,
             jobs_dead_lettered: self.jobs_dead_lettered,
@@ -259,6 +263,21 @@ fn spawn_scan_worker(
             }
         };
         let executor = build_executor();
+        let feedback_config = research_radar_core::feedback::FeedbackConfig::from_env();
+        let publish_config = research_radar_core::publish::PublishConfig::from_env();
+        let feedback_interval = feedback_config
+            .as_ref()
+            .map(|config| config.poll_interval_secs)
+            .unwrap_or(0);
+        if feedback_config.is_none() {
+            tracing::info!("scan worker: Triumvirate feedback polling disabled (kill switch RADAR_TRIUMVIRATE_DISABLE or zero poll interval)");
+        }
+        if publish_config.is_none() {
+            tracing::info!("scan worker: Triumvirate auto-publish disabled (kill switch RADAR_TRIUMVIRATE_DISABLE set)");
+        }
+        let mut last_feedback_poll = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(feedback_interval))
+            .unwrap_or_else(std::time::Instant::now);
 
         tracing::info!("scan worker started");
 
@@ -386,10 +405,83 @@ fn spawn_scan_worker(
                 h.is_processing = false;
             }
 
+            // ── Auto-publish recent findings to Triumvirate ─────
+            if let Some(cfg) = &publish_config {
+                let cfg = cfg.clone();
+                match tokio::task::spawn_blocking(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| e.to_string())?;
+                    rt.block_on(async move {
+                        let store = research_radar_core::RadarStore::init()
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let findings = store.list_findings(50).await.map_err(|e| e.to_string())?;
+                        let pool =
+                            research_radar_core::DbPool::init().map_err(|e| e.to_string())?;
+                        let auto = research_radar_core::AutoPublisher::from_config(&cfg, pool);
+                        auto.publish_cycle(&findings)
+                            .await
+                            .map_err(|e| e.to_string())
+                    })
+                })
+                .await
+                {
+                    Ok(Ok(summary)) => tracing::info!(
+                        published = summary.published,
+                        skipped_dup = summary.skipped_dup,
+                        skipped_gate = summary.skipped_gate,
+                        capped = summary.capped,
+                        "scan worker: auto-publish pass complete"
+                    ),
+                    Ok(Err(e)) => tracing::warn!("scan worker: auto-publish failed: {e}"),
+                    Err(e) => tracing::warn!("scan worker: auto-publish task failed: {e}"),
+                }
+            }
+
+            // ── Poll Triumvirate feedback for published findings ─
+            if let (Some(config), true) = (&feedback_config, feedback_interval > 0) {
+                let elapsed = last_feedback_poll.elapsed().as_secs();
+                if research_radar_core::feedback::should_poll_feedback(elapsed, feedback_interval) {
+                    last_feedback_poll = std::time::Instant::now();
+                    let config = config.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        let pool = DbPool::init().map_err(|e| e.to_string())?;
+                        let poller = research_radar_core::feedback::FeedbackPoller::from_config(
+                            &config, pool,
+                        );
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| e.to_string())?;
+                        rt.block_on(poller.poll_once()).map_err(|e| e.to_string())
+                    })
+                    .await
+                    {
+                        Ok(Ok(summary)) => {
+                            if let Ok(mut h) = health.lock() {
+                                h.last_feedback_poll = Some(summary.clone());
+                            }
+                            tracing::info!(
+                                "scan worker: feedback poll — polled {} accepted {} rejected {} pending {} errors {}",
+                                summary.polled,
+                                summary.accepted,
+                                summary.rejected,
+                                summary.still_pending,
+                                summary.errors
+                            );
+                        }
+                        Ok(Err(e)) => tracing::warn!("scan worker: feedback poll failed: {e}"),
+                        Err(e) => tracing::warn!("scan worker: feedback poll task failed: {e}"),
+                    }
+                }
+            }
+
             // ── Sleep until next poll cycle ─────────────────────
             // Sleep in 2-second increments so shutdown is responsive
-            let deadline =
-                tokio::time::Instant::now() + std::time::Duration::from_secs(WORKER_POLL_INTERVAL_SECS);
+            let deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_secs(WORKER_POLL_INTERVAL_SECS);
             while tokio::time::Instant::now() < deadline && !shutdown.load(Ordering::Relaxed) {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
@@ -515,6 +607,8 @@ fn handle_request(
         "match_get" => handle_match_get(pool, req.params),
         "subscription_set" => handle_subscription_set(pool, req.params),
         "source_health" => handle_source_health(pool, req.params),
+        "feedback_summary" => handle_feedback_summary(pool),
+        "radar_health" => handle_radar_health(pool, worker_health),
         "findings_list" => handle_findings_list(req.params),
         "worker_health" => handle_worker_health(worker_health),
         _ => {
@@ -751,6 +845,89 @@ fn handle_source_health(pool: &DbPool, params: Option<Value>) -> Result<Value, S
         .collect();
 
     Ok(serde_json::json!({ "sources": sources }))
+}
+
+fn handle_feedback_summary(pool: &DbPool) -> Result<Value, String> {
+    let rows = pool.outcome_rows().map_err(|e| e.to_string())?;
+    let by_source = research_radar_core::feedback::source_usefulness(&rows);
+    let by_domain = research_radar_core::feedback::domain_usefulness(&rows);
+    let total = rows.len();
+    let accepted = rows.iter().filter(|r| r.outcome == "accepted").count();
+    let rejected = rows.iter().filter(|r| r.outcome == "rejected").count();
+    let pending = total - accepted - rejected;
+
+    Ok(serde_json::json!({
+        "totals": {
+            "published": total,
+            "accepted": accepted,
+            "rejected": rejected,
+            "pending": pending
+        },
+        "by_source": serde_json::to_value(&by_source).map_err(|e| e.to_string())?,
+        "by_domain": serde_json::to_value(&by_domain).map_err(|e| e.to_string())?,
+    }))
+}
+
+fn handle_radar_health(
+    pool: &DbPool,
+    worker_health: &Arc<Mutex<WorkerHealth>>,
+) -> Result<Value, String> {
+    let health: Vec<SourceHealth> = pool.get_source_health(None).map_err(|e| e.to_string())?;
+    let sources: Vec<Value> = health
+        .into_iter()
+        .map(|h: SourceHealth| {
+            serde_json::json!({
+                "source_type": h.source_type,
+                "status": h.status,
+                "last_scan": h.last_scan,
+                "items_count": h.items_count,
+                "avg_relevance": h.avg_relevance
+            })
+        })
+        .collect();
+
+    let rows = pool.outcome_rows().map_err(|e| e.to_string())?;
+    let total = rows.len();
+    let accepted = rows.iter().filter(|r| r.outcome == "accepted").count();
+    let rejected = rows.iter().filter(|r| r.outcome == "rejected").count();
+    let pending = total - accepted - rejected;
+
+    let snapshot = worker_health
+        .lock()
+        .map_err(|e| format!("health lock poisoned: {e}"))?
+        .snapshot();
+    let last_poll_summary = snapshot
+        .last_feedback_poll
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|e| e.to_string())?
+        .unwrap_or(Value::Null);
+    let worker = serde_json::to_value(&snapshot).map_err(|e| e.to_string())?;
+    let configured_budget = research_radar_core::executor::llm_budget_microunits()
+        .map(Value::from)
+        .unwrap_or(Value::Null);
+    let per_call_budget = research_radar_core::executor::llm_budget_microunits()
+        .map(Value::from)
+        .unwrap_or(Value::Null);
+
+    Ok(serde_json::json!({
+        "sources": sources,
+        "feedback": {
+            "totals": {
+                "published": total,
+                "accepted": accepted,
+                "rejected": rejected,
+                "pending": pending
+            },
+            "last_poll_summary": last_poll_summary
+        },
+        "budget": {
+            "configured_microunits": configured_budget,
+            "per_call_microunits": per_call_budget
+        },
+        "worker": worker
+    }))
 }
 
 fn handle_worker_health(worker_health: &Arc<Mutex<WorkerHealth>>) -> Result<Value, String> {
@@ -1102,6 +1279,67 @@ mod tests {
     }
 
     #[test]
+    fn feedback_summary_aggregates_outcomes() {
+        let pool = test_pool();
+        pool.record_published_finding(
+            "f1",
+            &["o1".to_string()],
+            "arxiv",
+            "alignment",
+            0.8,
+            0.5,
+            None,
+        )
+        .unwrap();
+        pool.record_published_finding(
+            "f2",
+            &["o2".to_string()],
+            "arxiv",
+            "alignment",
+            0.7,
+            0.4,
+            None,
+        )
+        .unwrap();
+        pool.update_finding_outcome("f1", "accepted", "2026-01-02T00:00:00+00:00")
+            .unwrap();
+
+        let result = handle_feedback_summary(&pool).unwrap();
+
+        assert_eq!(result["totals"]["published"], 2);
+        assert_eq!(result["totals"]["accepted"], 1);
+        assert_eq!(result["totals"]["pending"], 1);
+        let by_source = result["by_source"].as_array().unwrap();
+        assert_eq!(by_source[0]["key"], "arxiv");
+    }
+
+    #[test]
+    fn radar_health_reports_sources_feedback_and_worker() {
+        let pool = DbPool::test_pool().unwrap();
+        pool.record_published_finding("f1", &["o1".into()], "arxiv", "alignment", 0.8, 0.5, None)
+            .unwrap();
+        pool.record_published_finding(
+            "f2",
+            &["o2".into()],
+            "semantic_scholar",
+            "alignment",
+            0.7,
+            0.4,
+            None,
+        )
+        .unwrap();
+        let health = Arc::new(Mutex::new(WorkerHealth::new()));
+
+        let result = handle_radar_health(&pool, &health).unwrap();
+
+        assert!(result.get("sources").is_some());
+        assert!(result.get("feedback").is_some());
+        assert!(result.get("budget").is_some());
+        assert!(result.get("worker").is_some());
+        assert_eq!(result["feedback"]["totals"]["published"], 2);
+    }
+
+    #[test]
     fn test_profile_list() {
         let pool = test_pool();
         // Create two profiles
@@ -1135,11 +1373,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let resp = rpc_call(
-            &pool,
-            "profile_get",
-            serde_json::json!({"profile_id": pid}),
-        );
+        let resp = rpc_call(&pool, "profile_get", serde_json::json!({"profile_id": pid}));
         assert!(resp.error.is_none());
         let result = resp.result.as_ref().unwrap();
         assert_eq!(result["name"].as_str().unwrap(), "Lookup");
@@ -1167,11 +1401,7 @@ mod tests {
         assert_eq!(resp.result.as_ref().unwrap()["deleted"], true);
 
         // Verify it's gone
-        let get_resp = rpc_call(
-            &pool,
-            "profile_get",
-            serde_json::json!({"profile_id": pid}),
-        );
+        let get_resp = rpc_call(&pool, "profile_get", serde_json::json!({"profile_id": pid}));
         assert!(get_resp.error.is_some());
     }
 
@@ -1189,11 +1419,7 @@ mod tests {
             .to_string();
 
         // Enqueue a job
-        rpc_call(
-            &pool,
-            "scan_now",
-            serde_json::json!({"profile_id": pid}),
-        );
+        rpc_call(&pool, "scan_now", serde_json::json!({"profile_id": pid}));
 
         // Query history by profile
         let resp = rpc_call(

@@ -15,10 +15,15 @@ use rusqlite::{params, Connection};
 use std::path::PathBuf;
 use uuid::Uuid;
 
+#[cfg(test)]
+pub(crate) static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // Re-exports for backward compatibility.
 pub use self::lance_store::RadarStore;
 pub use self::sqlite::DbPool;
-pub use self::sqlite::{SourceHealth, SourceHealthDetail, StorageError, MAX_JOB_ATTEMPTS};
+pub use self::sqlite::{
+    PublishedFindingRow, SourceHealth, SourceHealthDetail, StorageError, MAX_JOB_ATTEMPTS,
+};
 
 // ─── SQLite (existing pipeline) ─────────────────────────────────────────────
 
@@ -213,6 +218,20 @@ mod sqlite {
                     last_gap_skipped_at  TEXT,
                     rate_limit_until     TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS published_findings (
+                    finding_id     TEXT PRIMARY KEY,
+                    obligation_ids TEXT NOT NULL DEFAULT '[]',
+                    source_kind    TEXT NOT NULL,
+                    domain         TEXT NOT NULL,
+                    confidence     REAL NOT NULL DEFAULT 0.0,
+                    novelty        REAL NOT NULL DEFAULT 0.0,
+                    weakness_code  TEXT,
+                    outcome        TEXT NOT NULL DEFAULT 'pending',
+                    published_at   TEXT NOT NULL,
+                    last_polled_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_published_findings_outcome ON published_findings(outcome);
                 "#,
             )?;
             Ok(())
@@ -637,14 +656,16 @@ mod sqlite {
             Ok(job.id.clone())
         }
 
-        const SCAN_JOB_COLS: &'static str =
-            "id, profile_id, status, progress, total, reason, \
+        const SCAN_JOB_COLS: &'static str = "id, profile_id, status, progress, total, reason, \
              claimed_by, lease_token, lease_expires_at, heartbeat_at, last_progress_at, \
              attempt_count, profile_revision_at_enqueue, llm_spend_microunits, \
              warnings_json, error_json, progress_json, created_at, completed_at";
 
         pub fn get_scan_job(&self, id: &str) -> Result<Option<crate::ScanJob>> {
-            let sql = format!("SELECT {} FROM scan_jobs WHERE id = ?1", Self::SCAN_JOB_COLS);
+            let sql = format!(
+                "SELECT {} FROM scan_jobs WHERE id = ?1",
+                Self::SCAN_JOB_COLS
+            );
             let mut stmt = self.conn.prepare(&sql)?;
             let mut rows = stmt.query(params![id])?;
             if let Some(row) = rows.next()? {
@@ -744,12 +765,7 @@ mod sqlite {
             let updated = self.conn.execute(
                 "UPDATE scan_jobs SET status = ?3, completed_at = ?4 \
                  WHERE id = ?1 AND lease_token = ?2",
-                params![
-                    job_id,
-                    lease_token,
-                    status.as_str(),
-                    now.to_rfc3339(),
-                ],
+                params![job_id, lease_token, status.as_str(), now.to_rfc3339(),],
             )?;
             Ok(updated > 0)
         }
@@ -1150,6 +1166,20 @@ mod sqlite {
         pub rate_limit_until: Option<String>,
     }
 
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct PublishedFindingRow {
+        pub finding_id: String,
+        pub obligation_ids: Vec<String>,
+        pub source_kind: String,
+        pub domain: String,
+        pub confidence: f64,
+        pub novelty: f64,
+        pub weakness_code: Option<String>,
+        pub outcome: String,
+        pub published_at: String,
+        pub last_polled_at: Option<String>,
+    }
+
     impl DbPool {
         // ─── Watermarks ────────────────────────────────────────
 
@@ -1274,11 +1304,7 @@ mod sqlite {
         }
 
         /// Find an existing item by alias (hard-ID dedup).
-        pub fn find_by_alias(
-            &self,
-            alias_type: &str,
-            alias_value: &str,
-        ) -> Result<Option<String>> {
+        pub fn find_by_alias(&self, alias_type: &str, alias_value: &str) -> Result<Option<String>> {
             let mut stmt = self.conn.prepare(
                 "SELECT item_id FROM item_aliases \
                  WHERE alias_type = ?1 AND alias_value = ?2",
@@ -1391,6 +1417,125 @@ mod sqlite {
                 });
             }
             Ok(results)
+        }
+
+        // ─── Published Findings ────────────────────────────────
+
+        /// Record (idempotent upsert) a published finding for outcome tracking.
+        #[allow(clippy::too_many_arguments)]
+        pub fn record_published_finding(
+            &self,
+            finding_id: &str,
+            obligation_ids: &[String],
+            source_kind: &str,
+            domain: &str,
+            confidence: f64,
+            novelty: f64,
+            weakness_code: Option<&str>,
+        ) -> Result<()> {
+            let obligation_ids_json = serde_json::to_string(obligation_ids)?;
+            let now = Utc::now().to_rfc3339();
+            self.conn.execute(
+                "INSERT INTO published_findings \
+                 (finding_id, obligation_ids, source_kind, domain, confidence, novelty, \
+                  weakness_code, published_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 ON CONFLICT(finding_id) DO UPDATE SET \
+                 obligation_ids = excluded.obligation_ids, \
+                 source_kind = excluded.source_kind, \
+                 domain = excluded.domain, \
+                 confidence = excluded.confidence, \
+                 novelty = excluded.novelty, \
+                 weakness_code = excluded.weakness_code",
+                params![
+                    finding_id,
+                    obligation_ids_json,
+                    source_kind,
+                    domain,
+                    confidence,
+                    novelty,
+                    weakness_code,
+                    now,
+                ],
+            )?;
+            Ok(())
+        }
+
+        /// Set of finding_ids already present in published_findings (for cycle dedupe).
+        pub fn published_finding_ids(&self) -> Result<std::collections::HashSet<String>> {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT finding_id FROM published_findings")?;
+            let mut rows = stmt.query([])?;
+            let mut set = std::collections::HashSet::new();
+            while let Some(row) = rows.next()? {
+                set.insert(row.get::<_, String>(0)?);
+            }
+            Ok(set)
+        }
+
+        /// List findings whose outcome is still 'pending', oldest first, capped at `limit`.
+        pub fn list_pending_outcomes(&self, limit: usize) -> Result<Vec<PublishedFindingRow>> {
+            let mut stmt = self.conn.prepare(
+                "SELECT finding_id, obligation_ids, source_kind, domain, confidence, novelty, \
+                 weakness_code, outcome, published_at, last_polled_at \
+                 FROM published_findings \
+                 WHERE outcome = 'pending' \
+                 ORDER BY published_at ASC LIMIT ?1",
+            )?;
+            let mut results = Vec::new();
+            let mut rows = stmt.query(params![limit as i64])?;
+            while let Some(row) = rows.next()? {
+                results.push(Self::row_to_published_finding(row)?);
+            }
+            Ok(results)
+        }
+
+        /// Update a finding's outcome and last_polled_at.
+        pub fn update_finding_outcome(
+            &self,
+            finding_id: &str,
+            outcome: &str,
+            polled_at: &str,
+        ) -> Result<()> {
+            self.conn.execute(
+                "UPDATE published_findings SET outcome = ?2, last_polled_at = ?3 WHERE finding_id = ?1",
+                params![finding_id, outcome, polled_at],
+            )?;
+            Ok(())
+        }
+
+        /// All published-finding rows (for re-weighting aggregation).
+        pub fn outcome_rows(&self) -> Result<Vec<PublishedFindingRow>> {
+            let mut stmt = self.conn.prepare(
+                "SELECT finding_id, obligation_ids, source_kind, domain, confidence, novelty, \
+                 weakness_code, outcome, published_at, last_polled_at \
+                 FROM published_findings ORDER BY published_at ASC",
+            )?;
+            let mut results = Vec::new();
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                results.push(Self::row_to_published_finding(row)?);
+            }
+            Ok(results)
+        }
+
+        fn row_to_published_finding(
+            row: &rusqlite::Row,
+        ) -> std::result::Result<PublishedFindingRow, StorageError> {
+            let obligation_ids_json: String = row.get(1)?;
+            Ok(PublishedFindingRow {
+                finding_id: row.get(0)?,
+                obligation_ids: serde_json::from_str(&obligation_ids_json).unwrap_or_default(),
+                source_kind: row.get(2)?,
+                domain: row.get(3)?,
+                confidence: row.get(4)?,
+                novelty: row.get(5)?,
+                weakness_code: row.get(6)?,
+                outcome: row.get(7)?,
+                published_at: row.get(8)?,
+                last_polled_at: row.get(9)?,
+            })
         }
 
         /// Reclaim jobs whose leases have expired — reset them to pending so
@@ -1731,6 +1876,93 @@ mod sqlite {
             pool.set_rate_limit_until("s2", future).unwrap();
             assert!(pool.is_source_circuit_broken("s2"));
         }
+
+        #[test]
+        fn record_and_list_pending_published_finding() {
+            let pool = memory_pool();
+            let obligation_ids = vec!["obl-1".into(), "obl-2".into()];
+
+            pool.record_published_finding(
+                "finding-1",
+                &obligation_ids,
+                "paper",
+                "alignment",
+                0.82,
+                0.64,
+                Some("weak-prior"),
+            )
+            .unwrap();
+
+            let pending = pool.list_pending_outcomes(10).unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].finding_id, "finding-1");
+            assert_eq!(pending[0].obligation_ids, obligation_ids);
+            assert_eq!(pending[0].outcome, "pending");
+            assert_eq!(pending[0].weakness_code.as_deref(), Some("weak-prior"));
+        }
+
+        #[test]
+        fn update_finding_outcome_moves_out_of_pending() {
+            let pool = memory_pool();
+            let obligation_ids = vec!["obl-1".into()];
+
+            pool.record_published_finding(
+                "finding-1",
+                &obligation_ids,
+                "paper",
+                "alignment",
+                0.82,
+                0.64,
+                None,
+            )
+            .unwrap();
+            let polled_at = Utc::now().to_rfc3339();
+            pool.update_finding_outcome("finding-1", "accepted", &polled_at)
+                .unwrap();
+
+            let pending = pool.list_pending_outcomes(10).unwrap();
+            assert!(pending.is_empty());
+
+            let rows = pool.outcome_rows().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].outcome, "accepted");
+            assert_eq!(rows[0].last_polled_at.as_deref(), Some(polled_at.as_str()));
+        }
+
+        #[test]
+        fn record_published_finding_is_idempotent_and_preserves_outcome() {
+            let pool = memory_pool();
+            let obligation_ids = vec!["obl-1".into()];
+
+            pool.record_published_finding(
+                "finding-1",
+                &obligation_ids,
+                "paper",
+                "alignment",
+                0.82,
+                0.64,
+                None,
+            )
+            .unwrap();
+            let polled_at = Utc::now().to_rfc3339();
+            pool.update_finding_outcome("finding-1", "accepted", &polled_at)
+                .unwrap();
+            pool.record_published_finding(
+                "finding-1",
+                &obligation_ids,
+                "paper",
+                "alignment",
+                0.91,
+                0.64,
+                None,
+            )
+            .unwrap();
+
+            let rows = pool.outcome_rows().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].outcome, "accepted");
+            assert_eq!(rows[0].confidence, 0.91);
+        }
     }
 }
 
@@ -1740,7 +1972,11 @@ pub mod lance_store {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, BooleanArray, Float32Array, Int64Array, RecordBatch, StringArray};
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+    use arrow_array::{
+        Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Int64Array, RecordBatch,
+        StringArray,
+    };
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use chrono::{DateTime, Utc};
     use futures::TryStreamExt;
@@ -1779,6 +2015,8 @@ pub mod lance_store {
     }
 
     impl RadarStore {
+        pub const EMBED_DIM: i32 = 1024;
+
         /// Open (or create) the LanceDB store at `~/.research-radar/lance/`.
         pub async fn init() -> Result<Self> {
             let db_path = Self::db_path()?;
@@ -1843,6 +2081,9 @@ pub mod lance_store {
 
         // ─── Findings ─────────────────────────────────────────
 
+        // New stores get the nullable embedding vector column. Existing
+        // pre-embedding tables continue to work for reads; full legacy schema
+        // migration is out of scope, and a fresh store dir picks up the column.
         fn findings_schema() -> SchemaRef {
             Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
@@ -1863,6 +2104,14 @@ pub mod lance_store {
                 Field::new("discovered_at", DataType::Int64, false),
                 Field::new("related_entry_ids", DataType::Utf8, false),
                 Field::new("schema_version", DataType::Utf8, false),
+                Field::new(
+                    "embedding",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, true)),
+                        Self::EMBED_DIM,
+                    ),
+                    true,
+                ),
             ]))
         }
 
@@ -1873,10 +2122,28 @@ pub mod lance_store {
                 .execute()
                 .await
             {
-                Ok(_) => Ok(()),
-                Err(e) if e.to_string().contains("already exists") => Ok(()),
-                Err(e) => Err(LanceError::Lance(e)),
+                Ok(_) => return Ok(()),
+                Err(e) if e.to_string().contains("already exists") => {}
+                Err(e) => return Err(LanceError::Lance(e)),
             }
+
+            let table = self.conn.open_table("findings").execute().await?;
+            let existing = table.schema().await?;
+            let has_embedding = existing.fields().iter().any(|f| f.name() == "embedding");
+
+            if has_embedding {
+                return Ok(());
+            }
+
+            tracing::warn!(
+                "findings table missing 'embedding' column; recreating with embedding-enabled schema (legacy findings discarded)"
+            );
+            self.conn.drop_table("findings", &[]).await?;
+            self.conn
+                .create_empty_table("findings", Self::findings_schema())
+                .execute()
+                .await?;
+            Ok(())
         }
 
         async fn findings_table(&self) -> Result<Table> {
@@ -1886,6 +2153,19 @@ pub mod lance_store {
         /// Insert a Finding. Returns the finding id.
         pub async fn insert_finding(&self, finding: &Finding) -> Result<String> {
             let batch = self.findings_to_batch(std::iter::once(finding))?;
+            let table = self.findings_table().await?;
+            table.add(batch).execute().await?;
+            Ok(finding.id.clone())
+        }
+
+        /// Insert a Finding with an optional embedding. Returns the finding id.
+        pub async fn insert_finding_with_embedding(
+            &self,
+            finding: &Finding,
+            embedding: Option<&Vec<f32>>,
+        ) -> Result<String> {
+            let batch =
+                self.findings_to_batch_with_embeddings(std::iter::once((finding, embedding)))?;
             let table = self.findings_table().await?;
             table.add(batch).execute().await?;
             Ok(finding.id.clone())
@@ -1936,11 +2216,67 @@ pub mod lance_store {
             self.batch_to_findings(results).await
         }
 
+        /// Score a candidate embedding for novelty against the supplied prior
+        /// finding embeddings. Delegates to `crate::embedding::compute_novelty`.
+        /// (Prior embeddings are supplied by the caller; the findings table does not
+        /// yet persist a vector column.)
+        pub async fn score_finding_novelty(
+            &self,
+            candidate: &crate::embedding::Embedding,
+            priors: &[crate::embedding::Embedding],
+        ) -> f32 {
+            crate::embedding::compute_novelty(candidate, priors)
+        }
+
+        /// Fetch non-null prior finding embeddings for novelty comparison.
+        pub async fn fetch_finding_embeddings(&self, limit: usize) -> Result<Vec<Vec<f32>>> {
+            let table = self.findings_table().await?;
+            let stream = table.query().limit(limit).execute().await?;
+            let batches: Vec<_> = stream.try_collect().await?;
+            let mut vecs = Vec::new();
+
+            for batch in &batches {
+                let Some(column) = batch.column_by_name("embedding") else {
+                    continue;
+                };
+                let Some(array) = column.as_any().downcast_ref::<FixedSizeListArray>() else {
+                    continue;
+                };
+
+                for i in 0..array.len() {
+                    if array.is_null(i) {
+                        continue;
+                    }
+
+                    let values = array.value(i);
+                    let Some(float_values) = values.as_any().downcast_ref::<Float32Array>() else {
+                        continue;
+                    };
+
+                    let embedding: Vec<f32> = (0..float_values.len())
+                        .map(|j| float_values.value(j))
+                        .collect();
+                    if !embedding.is_empty() {
+                        vecs.push(embedding);
+                    }
+                }
+            }
+
+            Ok(vecs)
+        }
+
         // ─── Arrow conversion ─────────────────────────────────
 
         fn findings_to_batch<'a>(
             &self,
             findings: impl Iterator<Item = &'a Finding>,
+        ) -> Result<RecordBatch> {
+            self.findings_to_batch_with_embeddings(findings.map(|f| (f, None)))
+        }
+
+        fn findings_to_batch_with_embeddings<'a>(
+            &self,
+            rows: impl Iterator<Item = (&'a Finding, Option<&'a Vec<f32>>)>,
         ) -> Result<RecordBatch> {
             let mut ids = Vec::new();
             let mut source_urls = Vec::new();
@@ -1960,8 +2296,10 @@ pub mod lance_store {
             let mut discovered_ats = Vec::new();
             let mut related_entry_ids = Vec::new();
             let mut schema_versions = Vec::new();
+            let mut embedding_builder =
+                FixedSizeListBuilder::new(Float32Builder::new(), Self::EMBED_DIM);
 
-            for f in findings {
+            for (f, embedding) in rows {
                 ids.push(f.id.clone());
                 source_urls.push(f.source_url.clone());
                 source_titles.push(f.source_title.clone());
@@ -1987,7 +2325,24 @@ pub mod lance_store {
                 related_entry_ids
                     .push(serde_json::to_string(&f.related_entry_ids).unwrap_or_default());
                 schema_versions.push(f.schema_version.clone());
+
+                match embedding {
+                    Some(values) if values.len() == Self::EMBED_DIM as usize => {
+                        for value in values {
+                            embedding_builder.values().append_value(*value);
+                        }
+                        embedding_builder.append(true);
+                    }
+                    _ => {
+                        for _ in 0..Self::EMBED_DIM {
+                            embedding_builder.values().append_null();
+                        }
+                        embedding_builder.append(false);
+                    }
+                }
             }
+
+            let embedding_arr = embedding_builder.finish();
 
             RecordBatch::try_new(
                 Self::findings_schema(),
@@ -2010,6 +2365,7 @@ pub mod lance_store {
                     Arc::new(Int64Array::from(discovered_ats)),
                     Arc::new(StringArray::from(related_entry_ids)),
                     Arc::new(StringArray::from(schema_versions)),
+                    Arc::new(embedding_arr),
                 ],
             )
             .map_err(LanceError::Arrow)
@@ -2153,8 +2509,11 @@ pub mod lance_store {
                     summary: summary_arr.value(i).to_string(),
                     confidence: confidence_arr.value(i),
                     impact_weight: impact_weight_arr.value(i),
+                    novelty_score: 0.0,
                     urgency: UrgencyLevel::from_str(urgency_arr.value(i)),
                     suggested_action: suggested_action_arr.value(i).to_string(),
+                    applicability_hypothesis: String::new(),
+                    suggested_experiment: None,
                     applicability_tags,
                     cited_paper,
                     discovered_at,
@@ -2164,6 +2523,115 @@ pub mod lance_store {
             }
 
             Ok(findings)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::embedding::Embedding;
+        use crate::SourceType;
+
+        fn test_finding() -> Finding {
+            Finding::new(
+                "https://example.com/paper".to_string(),
+                "Example Paper".to_string(),
+                SourceType::Paper,
+                "systems".to_string(),
+                "Example finding".to_string(),
+                "A compact summary of the finding.".to_string(),
+                "Try the suggested change.".to_string(),
+                vec!["systems".to_string()],
+            )
+        }
+
+        #[tokio::test]
+        async fn score_finding_novelty_uses_cosine() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let store = RadarStore::test_store(dir.path())
+                .await
+                .expect("test store");
+
+            let candidate: Embedding = vec![1.0, 0.0, 0.0];
+
+            let empty_score = store.score_finding_novelty(&candidate, &[]).await;
+            assert_eq!(empty_score, 1.0);
+
+            let identical_prior = vec![vec![1.0, 0.0, 0.0]];
+            let identical_score = store
+                .score_finding_novelty(&candidate, &identical_prior)
+                .await;
+            assert!(identical_score < 1e-6);
+        }
+
+        #[tokio::test]
+        async fn insert_and_fetch_embedding_roundtrips() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let store = RadarStore::test_store(dir.path())
+                .await
+                .expect("test store");
+            let finding = test_finding();
+            let mut embedding = vec![0.0; RadarStore::EMBED_DIM as usize];
+            embedding[0] = 1.0;
+
+            store
+                .insert_finding_with_embedding(&finding, Some(&embedding))
+                .await
+                .unwrap();
+
+            let priors = store.fetch_finding_embeddings(10).await.unwrap();
+            assert_eq!(priors.len(), 1);
+            assert_eq!(priors[0].len(), RadarStore::EMBED_DIM as usize);
+            assert_eq!(priors[0][0], 1.0);
+        }
+
+        #[tokio::test]
+        async fn migrates_legacy_findings_table_without_embedding() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let conn = lancedb::connection::connect(dir.path().to_str().unwrap())
+                .execute()
+                .await
+                .unwrap();
+            let full = RadarStore::findings_schema();
+            let legacy_fields: Vec<_> = full
+                .fields()
+                .iter()
+                .filter(|f| f.name() != "embedding")
+                .map(|f| (**f).clone())
+                .collect();
+            let legacy_schema = std::sync::Arc::new(arrow_schema::Schema::new(legacy_fields));
+            conn.create_empty_table("findings", legacy_schema)
+                .execute()
+                .await
+                .unwrap();
+
+            let store = RadarStore::test_store(dir.path()).await.unwrap();
+            let finding = test_finding();
+            let mut embedding = vec![0.0; RadarStore::EMBED_DIM as usize];
+            embedding[0] = 1.0;
+
+            store
+                .insert_finding_with_embedding(&finding, Some(&embedding))
+                .await
+                .unwrap();
+
+            let priors = store.fetch_finding_embeddings(10).await.unwrap();
+            assert_eq!(priors.len(), 1);
+            assert_eq!(priors[0].len(), RadarStore::EMBED_DIM as usize);
+        }
+
+        #[tokio::test]
+        async fn insert_without_embedding_yields_no_priors() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let store = RadarStore::test_store(dir.path())
+                .await
+                .expect("test store");
+            let finding = test_finding();
+
+            store.insert_finding(&finding).await.unwrap();
+
+            let priors = store.fetch_finding_embeddings(10).await.unwrap();
+            assert!(priors.is_empty());
         }
     }
 }

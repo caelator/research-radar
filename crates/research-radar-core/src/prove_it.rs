@@ -10,9 +10,11 @@ mod tests {
     use rusqlite::params;
 
     use crate::{
-        DbPool, Entry, Finding, ItemAlias, PaperRef, PipelineExecutor, Profile,
-        ScanJob, ScanJobStatus, Source, SourceType, UrgencyLevel,
-        MAX_JOB_ATTEMPTS,
+        feedback::{source_usefulness, FeedbackPoller},
+        storage::HOME_ENV_LOCK,
+        triumvirate::TriumviratePublisher,
+        DbPool, Entry, Finding, ItemAlias, PaperRef, PipelineExecutor, Profile, ScanJob,
+        ScanJobStatus, Source, SourceType, UrgencyLevel, MAX_JOB_ATTEMPTS,
     };
 
     fn memory_pool() -> DbPool {
@@ -48,10 +50,7 @@ mod tests {
         let details = pool.get_all_source_health().unwrap();
         let arxiv = details.iter().find(|d| d.source_type == "arxiv").unwrap();
         assert_eq!(arxiv.consecutive_failures, 3);
-        assert_eq!(
-            arxiv.last_error_category.as_deref(),
-            Some("HTTP 429")
-        );
+        assert_eq!(arxiv.last_error_category.as_deref(), Some("HTTP 429"));
 
         // Recovery: a single success resets the breaker
         pool.upsert_source_health("arxiv", true, None).unwrap();
@@ -65,7 +64,9 @@ mod tests {
         let arxiv = details.iter().find(|d| d.source_type == "arxiv").unwrap();
         assert_eq!(arxiv.consecutive_failures, 0);
 
-        eprintln!("ARTIFACT: induced_429_circuit_breaker — OPEN after 3 failures, CLOSED after 1 success");
+        eprintln!(
+            "ARTIFACT: induced_429_circuit_breaker — OPEN after 3 failures, CLOSED after 1 success"
+        );
     }
 
     /// Proof A2: Induced 500 / timeout on multiple sources — each source's circuit
@@ -132,6 +133,7 @@ mod tests {
     /// Full lifecycle: pending → running(claimed) → expired → pending(reclaimed) → running → complete.
     #[tokio::test(flavor = "multi_thread")]
     async fn lease_expiry_reclaim_and_recovery_lifecycle() {
+        let _home_guard = HOME_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let tmp_home = tempfile::TempDir::new().unwrap();
         let lance_dir = tmp_home.path().join("lance");
         let pool = memory_pool();
@@ -147,7 +149,9 @@ mod tests {
         pool.insert_entry(&entry).unwrap();
 
         // Step 1: Enqueue and claim
-        let job = pool.enqueue_job(&profile.id, Some("resilience test".into())).unwrap();
+        let job = pool
+            .enqueue_job(&profile.id, Some("resilience test".into()))
+            .unwrap();
         let claimed = pool.claim_scan_job(&job.id).unwrap().unwrap();
         assert_eq!(claimed.status, ScanJobStatus::Running);
         assert_eq!(claimed.attempt_count, 1);
@@ -223,7 +227,10 @@ mod tests {
 
         // Verify claim_next does NOT pick up dead-lettered jobs
         let next = pool.claim_next_scan_job().unwrap();
-        assert!(next.is_none(), "dead-lettered job should not be re-claimable");
+        assert!(
+            next.is_none(),
+            "dead-lettered job should not be re-claimable"
+        );
 
         eprintln!(
             "ARTIFACT: dead_letter — job permanently failed after {} attempts, error={}",
@@ -236,6 +243,7 @@ mod tests {
     /// sequentially without external intervention.
     #[tokio::test(flavor = "multi_thread")]
     async fn self_scheduling_sequential_jobs() {
+        let _home_guard = HOME_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let tmp_home = tempfile::TempDir::new().unwrap();
         let lance_dir = tmp_home.path().join("lance");
 
@@ -283,6 +291,7 @@ mod tests {
     /// degradation, no crash, job still completes.
     #[tokio::test(flavor = "multi_thread")]
     async fn pipeline_completes_with_all_sources_broken() {
+        let _home_guard = HOME_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let tmp_home = tempfile::TempDir::new().unwrap();
         let lance_dir = tmp_home.path().join("lance");
         let pool = memory_pool();
@@ -349,15 +358,15 @@ mod tests {
         assert!(renewed, "correct token should renew lease");
 
         // Complete with wrong token fails
-        let completed =
-            pool.complete_job_fenced(&job.id, fake_token, ScanJobStatus::Complete)
-                .unwrap();
+        let completed = pool
+            .complete_job_fenced(&job.id, fake_token, ScanJobStatus::Complete)
+            .unwrap();
         assert!(!completed, "stale token should not complete job");
 
         // Complete with correct token succeeds
-        let completed =
-            pool.complete_job_fenced(&job.id, &real_token, ScanJobStatus::Complete)
-                .unwrap();
+        let completed = pool
+            .complete_job_fenced(&job.id, &real_token, ScanJobStatus::Complete)
+            .unwrap();
         assert!(completed, "correct token should complete job");
 
         eprintln!("ARTIFACT: heartbeat_fencing — stale token rejected for heartbeat and complete");
@@ -399,7 +408,9 @@ mod tests {
         );
         // The Low urgency one should NOT be actionable
         assert!(
-            !actionable.iter().any(|f| f.title == "Minor style suggestion"),
+            !actionable
+                .iter()
+                .any(|f| f.title == "Minor style suggestion"),
             "Low urgency finding should not be actionable"
         );
 
@@ -499,6 +510,7 @@ mod tests {
     /// Proof B3: End-to-end pipeline → findings surface — a scan job produces
     /// findings that a consumer can query from LanceDB.
     #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::await_holding_lock)] // HOME_ENV_LOCK must serialize HOME through RadarStore awaits.
     async fn pipeline_produces_queryable_findings() {
         let tmp_home = tempfile::TempDir::new().unwrap();
         let lance_dir = tmp_home.path().join("lance");
@@ -509,9 +521,21 @@ mod tests {
 
         // Insert multiple sources with varying relevance
         let sources = vec![
-            ("https://example.com/ai-safety", "AI Safety Research", "AI safety alignment verification research"),
-            ("https://example.com/unrelated", "Cooking Recipes", "How to make a perfect soufflé"),
-            ("https://example.com/ml-ops", "ML Operations Guide", "AI safety in production ML systems"),
+            (
+                "https://example.com/ai-safety",
+                "AI Safety Research",
+                "AI safety alignment verification research",
+            ),
+            (
+                "https://example.com/unrelated",
+                "Cooking Recipes",
+                "How to make a perfect soufflé",
+            ),
+            (
+                "https://example.com/ml-ops",
+                "ML Operations Guide",
+                "AI safety in production ML systems",
+            ),
         ];
 
         for (url, title, content) in sources {
@@ -541,8 +565,14 @@ mod tests {
         for f in &findings {
             assert!(!f.id.is_empty(), "finding must have an id");
             assert!(!f.title.is_empty(), "finding must have a title");
-            assert!(!f.suggested_action.is_empty(), "finding must have a suggested action");
-            assert!(!f.related_entry_ids.is_empty(), "finding must trace back to entries");
+            assert!(
+                !f.suggested_action.is_empty(),
+                "finding must have a suggested action"
+            );
+            assert!(
+                !f.related_entry_ids.is_empty(),
+                "finding must trace back to entries"
+            );
             assert_eq!(f.schema_version, "1.0");
         }
 
@@ -567,28 +597,32 @@ mod tests {
             make_finding_full(
                 "CVE-2024-1234 in reqwest",
                 UrgencyLevel::Critical,
-                0.99, 0.95,
+                0.99,
+                0.95,
                 "Update reqwest to >= 0.12.5",
                 vec!["cve", "security", "http"],
             ),
             make_finding_full(
                 "Structured concurrency pattern from SOSP paper",
                 UrgencyLevel::Medium,
-                0.72, 0.6,
+                0.72,
+                0.6,
                 "Refactor task spawning to use structured concurrency",
                 vec!["async-runtime", "tokio", "concurrency"],
             ),
             make_finding_full(
                 "Lock-free data structure optimization",
                 UrgencyLevel::High,
-                0.81, 0.7,
+                0.81,
+                0.7,
                 "Replace Arc<Mutex<T>> with concurrent hashmap in hot path",
                 vec!["performance", "lock-free"],
             ),
             make_finding_full(
                 "Minor code style improvement",
                 UrgencyLevel::Low,
-                0.3, 0.1,
+                0.3,
+                0.1,
                 "Consider renaming variable for clarity",
                 vec!["style"],
             ),
@@ -679,7 +713,10 @@ mod tests {
             SourceType::Paper,
         );
         pool.insert_source(&source_arxiv).unwrap();
-        let entry_arxiv = Entry::new(source_arxiv.id.clone(), "Paper ABC content from arXiv".into());
+        let entry_arxiv = Entry::new(
+            source_arxiv.id.clone(),
+            "Paper ABC content from arXiv".into(),
+        );
         pool.insert_entry(&entry_arxiv).unwrap();
 
         // Register aliases for the arXiv paper
@@ -876,9 +913,16 @@ mod tests {
              Unique contributions: arxiv={}, openalex={}, s2={}\n\
              Cross-source dedup hits: {}\n\
              OpenAlex added {} unique papers not in arXiv/S2",
-            arxiv_aliases, oa_aliases, s2_aliases,
-            arxiv_unique, oa_unique,
-            unique_contribs.iter().find(|(s, _)| s == "semantic_scholar").map(|(_, c)| *c).unwrap_or(0),
+            arxiv_aliases,
+            oa_aliases,
+            s2_aliases,
+            arxiv_unique,
+            oa_unique,
+            unique_contribs
+                .iter()
+                .find(|(s, _)| s == "semantic_scholar")
+                .map(|(_, c)| *c)
+                .unwrap_or(0),
             dedup_hits,
             oa_unique
         );
@@ -901,12 +945,20 @@ mod tests {
             let entry = Entry::new(src.id.clone(), format!("CS arXiv paper {i}"));
             pool.insert_entry(&entry).unwrap();
             pool.insert_alias(&ItemAlias::new(
-                entry.id.clone(), "arxiv_id".into(), format!("cs-{i}"), "arxiv".into(),
-            )).unwrap();
+                entry.id.clone(),
+                "arxiv_id".into(),
+                format!("cs-{i}"),
+                "arxiv".into(),
+            ))
+            .unwrap();
         }
 
         // OpenAlex: non-CS papers (biology, economics) — these would never appear on arXiv
-        let domains = ["biomedical-ai", "computational-economics", "materials-science"];
+        let domains = [
+            "biomedical-ai",
+            "computational-economics",
+            "materials-science",
+        ];
         for (i, domain) in domains.iter().enumerate() {
             let src = Source::new(
                 format!("https://openalex.org/W-{domain}-{i}"),
@@ -924,14 +976,16 @@ mod tests {
                 "openalex_id".into(),
                 format!("W-{domain}-{i}"),
                 "openalex".into(),
-            )).unwrap();
+            ))
+            .unwrap();
             // These papers have DOIs but NO arxiv_id — unique to OA
             pool.insert_alias(&ItemAlias::new(
                 entry.id.clone(),
                 "doi".into(),
                 format!("10.9999/{domain}-{i}"),
                 "openalex".into(),
-            )).unwrap();
+            ))
+            .unwrap();
         }
 
         let unique = pool.count_unique_contributions_by_source().unwrap();
@@ -951,10 +1005,8 @@ mod tests {
             let oa_id = format!("W-{domain}-{i}");
             let item_id = pool.find_by_alias("openalex_id", &oa_id).unwrap().unwrap();
             let arxiv_alias = pool.find_by_alias("arxiv_id", &item_id);
-            assert!(
-                arxiv_alias.unwrap().is_none() || true, // alias lookup is by value not item_id
-                "OA-unique papers should not have arxiv counterparts"
-            );
+            // Alias lookup is by value, not item_id, so this lookup is not a meaningful arxiv-counterpart check here.
+            let _ = arxiv_alias;
         }
 
         eprintln!(
@@ -1018,9 +1070,12 @@ mod tests {
              arxiv: failures={}, broken={}\n\
              semantic_scholar: failures={}, broken={}\n\
              openalex: failures={}, broken={}",
-            arxiv.consecutive_failures, pool.is_source_circuit_broken("arxiv"),
-            s2.consecutive_failures, pool.is_source_circuit_broken("semantic_scholar"),
-            oa.consecutive_failures, pool.is_source_circuit_broken("openalex"),
+            arxiv.consecutive_failures,
+            pool.is_source_circuit_broken("arxiv"),
+            s2.consecutive_failures,
+            pool.is_source_circuit_broken("semantic_scholar"),
+            oa.consecutive_failures,
+            pool.is_source_circuit_broken("openalex"),
         );
     }
 
@@ -1032,7 +1087,9 @@ mod tests {
     /// directory, then a separate consumer opens the *same path* and reads them.
     /// This proves the handoff contract survives real I/O, not just in-memory stores.
     #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::await_holding_lock)] // HOME_ENV_LOCK must serialize HOME through RadarStore awaits.
     async fn live_disk_handoff_pipeline_to_consumer() {
+        let _home_guard = HOME_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let tmp_home = tempfile::TempDir::new().unwrap();
         // Use an explicit LanceDB directory so both producer and consumer
         // resolve to the same store without mutating the global HOME env var
@@ -1048,10 +1105,26 @@ mod tests {
 
         // Seed sources with varying relevance (same pattern as B3 but richer)
         let sources = vec![
-            ("https://arxiv.org/abs/2401.99901", "Async Runtime Verification", "rust async runtime formal verification safety techniques"),
-            ("https://arxiv.org/abs/2401.99902", "Memory Safety Patterns", "rust memory safety borrow checker improvements"),
-            ("https://example.com/cooking", "Best Pasta Recipes", "How to cook carbonara perfectly"),
-            ("https://arxiv.org/abs/2401.99903", "Lock-Free Queues in Rust", "rust async lock-free concurrent queue safety"),
+            (
+                "https://arxiv.org/abs/2401.99901",
+                "Async Runtime Verification",
+                "rust async runtime formal verification safety techniques",
+            ),
+            (
+                "https://arxiv.org/abs/2401.99902",
+                "Memory Safety Patterns",
+                "rust memory safety borrow checker improvements",
+            ),
+            (
+                "https://example.com/cooking",
+                "Best Pasta Recipes",
+                "How to cook carbonara perfectly",
+            ),
+            (
+                "https://arxiv.org/abs/2401.99903",
+                "Lock-Free Queues in Rust",
+                "rust async lock-free concurrent queue safety",
+            ),
         ];
         for (url, title, content) in &sources {
             let src = Source::new(url.to_string(), title.to_string(), SourceType::Paper);
@@ -1110,7 +1183,10 @@ mod tests {
             let tags = item["applicability_tags"].as_array().unwrap();
             assert!(!tags.is_empty(), "applicability_tags must not be empty");
             let entry_ids = item["related_entry_ids"].as_array().unwrap();
-            assert!(!entry_ids.is_empty(), "related_entry_ids must trace to source entries");
+            assert!(
+                !entry_ids.is_empty(),
+                "related_entry_ids must trace to source entries"
+            );
         }
 
         // Write handoff artifact to disk (proves file-based handoff is viable)
@@ -1177,11 +1253,17 @@ mod tests {
         // Both consumers see the same IDs
         let a_ids: std::collections::HashSet<_> = a_findings.iter().map(|f| &f.id).collect();
         let b_ids: std::collections::HashSet<_> = b_findings.iter().map(|f| &f.id).collect();
-        assert_eq!(a_ids, b_ids, "both consumers must see identical finding sets");
+        assert_eq!(
+            a_ids, b_ids,
+            "both consumers must see identical finding sets"
+        );
 
         // Citations survived for both
         for f in a_findings.iter().chain(b_findings.iter()) {
-            assert!(f.cited_paper.is_some(), "citation must survive for all findings");
+            assert!(
+                f.cited_paper.is_some(),
+                "citation must survive for all findings"
+            );
         }
 
         eprintln!(
@@ -1217,10 +1299,10 @@ mod tests {
         // Serialize to JSON, inject an unknown field (simulating schema 1.1)
         let fetched = store.get_finding(&finding.id).await.unwrap().unwrap();
         let mut json_val = serde_json::to_value(&fetched).unwrap();
-        json_val.as_object_mut().unwrap().insert(
-            "experimental_score".into(),
-            serde_json::json!(0.42),
-        );
+        json_val
+            .as_object_mut()
+            .unwrap()
+            .insert("experimental_score".into(), serde_json::json!(0.42));
         json_val.as_object_mut().unwrap().insert(
             "new_field_in_1_1".into(),
             serde_json::json!("some new data"),
@@ -1248,15 +1330,14 @@ mod tests {
     /// collecting per-cycle metrics. Asserts no degradation, no accumulation of
     /// failed jobs, and monotonically increasing findings count.
     #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::await_holding_lock)] // HOME_ENV_LOCK must serialize HOME through RadarStore awaits.
     async fn multi_cycle_soak_no_degradation() {
+        let _home_guard = HOME_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let tmp_home = tempfile::TempDir::new().unwrap();
         let lance_dir = tmp_home.path().join("lance");
 
         let pool = DbPool::test_pool().unwrap();
-        let profile = Profile::new(
-            "soak-test".into(),
-            vec!["rust".into(), "systems".into()],
-        );
+        let profile = Profile::new("soak-test".into(), vec!["rust".into(), "systems".into()]);
         pool.insert_profile(&profile).unwrap();
 
         // Seed a fixed set of sources
@@ -1359,10 +1440,7 @@ mod tests {
             .iter()
             .filter(|j| j.status == ScanJobStatus::Running)
             .count();
-        assert_eq!(
-            failed_count, 0,
-            "no failed jobs after {SOAK_CYCLES} cycles"
-        );
+        assert_eq!(failed_count, 0, "no failed jobs after {SOAK_CYCLES} cycles");
         assert_eq!(
             running_count, 0,
             "no stuck running jobs after {SOAK_CYCLES} cycles"
@@ -1424,7 +1502,7 @@ mod tests {
             ("arxiv", true, None),              // recovery
             ("arxiv", true, None),
             ("arxiv", false, Some("timeout")),
-            ("arxiv", true, None),              // immediate recovery
+            ("arxiv", true, None), // immediate recovery
             ("arxiv", true, None),
         ];
 
@@ -1440,9 +1518,7 @@ mod tests {
             if breaker_was_open && !broken {
                 breaker_recovered = true;
             }
-            eprintln!(
-                "  soak cycle {i}: {source} success={success} broken={broken}"
-            );
+            eprintln!("  soak cycle {i}: {source} success={success} broken={broken}");
         }
 
         assert!(
@@ -1460,9 +1536,7 @@ mod tests {
             "arxiv should be healthy at end of soak"
         );
 
-        eprintln!(
-            "ARTIFACT: soak_breaker_recovery — breaker opened and recovered autonomously"
-        );
+        eprintln!("ARTIFACT: soak_breaker_recovery — breaker opened and recovered autonomously");
     }
 
     /// Proof E3: Lease reclaim under soak — expired leases are reclaimed and
@@ -1472,10 +1546,7 @@ mod tests {
         let tmp_home = tempfile::TempDir::new().unwrap();
         let lance_dir = tmp_home.path().join("lance");
         let pool = memory_pool();
-        let profile = Profile::new(
-            "soak-lease".into(),
-            vec!["test".into()],
-        );
+        let profile = Profile::new("soak-lease".into(), vec!["test".into()]);
         pool.insert_profile(&profile).unwrap();
 
         // Add a source and entry so the executor has something to process
@@ -1510,7 +1581,10 @@ mod tests {
 
         // Reclaim expired leases
         let (reclaimed_count, _dead_lettered) = pool.reclaim_expired_leases().unwrap();
-        assert!(reclaimed_count >= 1, "at least one expired lease should be reclaimed");
+        assert!(
+            reclaimed_count >= 1,
+            "at least one expired lease should be reclaimed"
+        );
 
         // The reclaimed job should be pending again
         let rechecked = pool.get_scan_job(&job_ids[0]).unwrap().unwrap();
@@ -1568,7 +1642,8 @@ mod tests {
         let claimed = pool.claim_scan_job(&job.id).unwrap();
         assert!(claimed.is_some(), "PROVEN: job claiming works");
         let token = claimed.unwrap().lease_token.unwrap();
-        pool.complete_job_fenced(&job.id, &token, ScanJobStatus::Complete).unwrap();
+        pool.complete_job_fenced(&job.id, &token, ScanJobStatus::Complete)
+            .unwrap();
 
         // ── 3. Circuit breaker: trip and recovery ──
         for _ in 0..3 {
@@ -1586,7 +1661,8 @@ mod tests {
         );
 
         // ── 4. Rate-limit backoff ──
-        pool.upsert_source_health("backoff-src", true, None).unwrap();
+        pool.upsert_source_health("backoff-src", true, None)
+            .unwrap();
         let future = chrono::Utc::now() + Duration::minutes(5);
         pool.set_rate_limit_until("backoff-src", future).unwrap();
         assert!(
@@ -1612,7 +1688,10 @@ mod tests {
         let entry = Entry::new(src.id.clone(), "test".into());
         pool.insert_entry(&entry).unwrap();
         let alias = ItemAlias::new(
-            entry.id.clone(), "doi".into(), "10.test/123".into(), "arxiv".into(),
+            entry.id.clone(),
+            "doi".into(),
+            "10.test/123".into(),
+            "arxiv".into(),
         );
         pool.insert_alias(&alias).unwrap();
         assert!(
@@ -1691,7 +1770,9 @@ mod tests {
     /// and validates every contract field. This proves the last mile between
     /// research-radar and any evolve-style consumer.
     #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::await_holding_lock)] // HOME_ENV_LOCK must serialize HOME through RadarStore awaits.
     async fn evolve_consumer_batch_simulation_with_manifest() {
+        let _home_guard = HOME_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let tmp_home = tempfile::TempDir::new().unwrap();
         let lance_dir = tmp_home.path().join("lance");
 
@@ -1706,22 +1787,46 @@ mod tests {
 
         let profile_ml = Profile::new(
             "ml-ops".into(),
-            vec!["machine learning".into(), "operations".into(), "inference".into()],
+            vec![
+                "machine learning".into(),
+                "operations".into(),
+                "inference".into(),
+            ],
         );
         pool.insert_profile(&profile_ml).unwrap();
 
         // Seed diverse sources that cross profile boundaries
         let sources = vec![
-            ("https://arxiv.org/abs/2401.50001", "Rust Memory Safety via Formal Verification",
-             "rust memory safety formal verification borrow checker improvements", SourceType::Paper),
-            ("https://arxiv.org/abs/2401.50002", "ML Inference Optimization on Edge Devices",
-             "machine learning inference optimization edge deployment operations", SourceType::Paper),
-            ("https://arxiv.org/abs/2401.50003", "Safe Async Patterns for Systems Programming",
-             "rust async safety patterns systems programming tokio", SourceType::Paper),
-            ("https://example.com/cooking", "Pasta Recipes",
-             "how to cook carbonara al dente", SourceType::Web),
-            ("https://arxiv.org/abs/2401.50004", "Scalable ML Pipeline Monitoring",
-             "machine learning operations monitoring pipeline safety inference", SourceType::Paper),
+            (
+                "https://arxiv.org/abs/2401.50001",
+                "Rust Memory Safety via Formal Verification",
+                "rust memory safety formal verification borrow checker improvements",
+                SourceType::Paper,
+            ),
+            (
+                "https://arxiv.org/abs/2401.50002",
+                "ML Inference Optimization on Edge Devices",
+                "machine learning inference optimization edge deployment operations",
+                SourceType::Paper,
+            ),
+            (
+                "https://arxiv.org/abs/2401.50003",
+                "Safe Async Patterns for Systems Programming",
+                "rust async safety patterns systems programming tokio",
+                SourceType::Paper,
+            ),
+            (
+                "https://example.com/cooking",
+                "Pasta Recipes",
+                "how to cook carbonara al dente",
+                SourceType::Web,
+            ),
+            (
+                "https://arxiv.org/abs/2401.50004",
+                "Scalable ML Pipeline Monitoring",
+                "machine learning operations monitoring pipeline safety inference",
+                SourceType::Paper,
+            ),
         ];
 
         for (url, title, content, stype) in &sources {
@@ -1737,7 +1842,11 @@ mod tests {
         for profile in [&profile_rust, &profile_ml] {
             let _job = pool.enqueue_job(&profile.id, None).unwrap();
             let run = executor.run_next(&pool).unwrap().unwrap();
-            assert!(run.candidates >= 1, "profile '{}' must have candidates", profile.name);
+            assert!(
+                run.candidates >= 1,
+                "profile '{}' must have candidates",
+                profile.name
+            );
         }
 
         // ── Independent consumer opens the SAME store ──
@@ -1766,7 +1875,9 @@ mod tests {
                 );
 
                 // Build PR body (what evolve would use as the PR description)
-                let citation_line = f.cited_paper.as_ref()
+                let citation_line = f
+                    .cited_paper
+                    .as_ref()
                     .map(|p| format!("\n\n**Citation:** {}", p.citation()))
                     .unwrap_or_default();
                 let pr_body = format!(
@@ -1852,30 +1963,51 @@ mod tests {
         // Validate every PR intent has all required contract fields
         let intents = parsed["pr_intents"].as_array().unwrap();
         for (i, intent) in intents.iter().enumerate() {
-            assert!(!intent["finding_id"].as_str().unwrap().is_empty(),
-                "intent {i}: finding_id must be non-empty");
-            assert!(!intent["pr_title"].as_str().unwrap().is_empty(),
-                "intent {i}: pr_title must be non-empty");
-            assert!(!intent["pr_body"].as_str().unwrap().is_empty(),
-                "intent {i}: pr_body must be non-empty");
-            assert!(!intent["suggested_action"].as_str().unwrap().is_empty(),
-                "intent {i}: suggested_action must be non-empty");
-            assert!(!intent["domain"].as_str().unwrap().is_empty(),
-                "intent {i}: domain must be non-empty");
-            assert!(!intent["applicability_tags"].as_array().unwrap().is_empty(),
-                "intent {i}: applicability_tags must not be empty");
-            assert!(!intent["related_entry_ids"].as_array().unwrap().is_empty(),
-                "intent {i}: related_entry_ids must trace to entries");
-            assert_eq!(intent["schema_version"].as_str().unwrap(), "1.0",
-                "intent {i}: schema_version must be 1.0");
-            assert!(intent["is_actionable"].as_bool().unwrap(),
-                "intent {i}: must be actionable (was in actionable query)");
+            assert!(
+                !intent["finding_id"].as_str().unwrap().is_empty(),
+                "intent {i}: finding_id must be non-empty"
+            );
+            assert!(
+                !intent["pr_title"].as_str().unwrap().is_empty(),
+                "intent {i}: pr_title must be non-empty"
+            );
+            assert!(
+                !intent["pr_body"].as_str().unwrap().is_empty(),
+                "intent {i}: pr_body must be non-empty"
+            );
+            assert!(
+                !intent["suggested_action"].as_str().unwrap().is_empty(),
+                "intent {i}: suggested_action must be non-empty"
+            );
+            assert!(
+                !intent["domain"].as_str().unwrap().is_empty(),
+                "intent {i}: domain must be non-empty"
+            );
+            assert!(
+                !intent["applicability_tags"].as_array().unwrap().is_empty(),
+                "intent {i}: applicability_tags must not be empty"
+            );
+            assert!(
+                !intent["related_entry_ids"].as_array().unwrap().is_empty(),
+                "intent {i}: related_entry_ids must trace to entries"
+            );
+            assert_eq!(
+                intent["schema_version"].as_str().unwrap(),
+                "1.0",
+                "intent {i}: schema_version must be 1.0"
+            );
+            assert!(
+                intent["is_actionable"].as_bool().unwrap(),
+                "intent {i}: must be actionable (was in actionable query)"
+            );
             // Priority ordering preserved
             if i > 0 {
                 let prev_score = intents[i - 1]["priority_score"].as_f64().unwrap();
                 let curr_score = intent["priority_score"].as_f64().unwrap();
-                assert!(prev_score >= curr_score,
-                    "intent {i}: priority must be non-increasing: {prev_score} >= {curr_score}");
+                assert!(
+                    prev_score >= curr_score,
+                    "intent {i}: priority must be non-increasing: {prev_score} >= {curr_score}"
+                );
             }
         }
 
@@ -1903,7 +2035,9 @@ mod tests {
     /// and verifies recovery. Writes a structured soak observability report
     /// to disk that an external monitor can consume.
     #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::await_holding_lock)] // HOME_ENV_LOCK must serialize HOME through RadarStore awaits.
     async fn extended_soak_with_observability_artifact() {
+        let _home_guard = HOME_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let tmp_home = tempfile::TempDir::new().unwrap();
         let lance_dir = tmp_home.path().join("lance");
 
@@ -1924,7 +2058,9 @@ mod tests {
             pool.insert_source(&src).unwrap();
             let entry = Entry::new(
                 src.id.clone(),
-                format!("rust systems performance research paper {i} about safety and optimization"),
+                format!(
+                    "rust systems performance research paper {i} about safety and optimization"
+                ),
             );
             pool.insert_entry(&entry).unwrap();
         }
@@ -1967,11 +2103,13 @@ mod tests {
             let health = pool.get_all_source_health().unwrap();
             let health_snapshot: Vec<serde_json::Value> = health
                 .iter()
-                .map(|h| serde_json::json!({
-                    "source": h.source_type,
-                    "consecutive_failures": h.consecutive_failures,
-                    "circuit_broken": pool.is_source_circuit_broken(&h.source_type),
-                }))
+                .map(|h| {
+                    serde_json::json!({
+                        "source": h.source_type,
+                        "consecutive_failures": h.consecutive_failures,
+                        "circuit_broken": pool.is_source_circuit_broken(&h.source_type),
+                    })
+                })
                 .collect();
 
             let completed_job = pool.get_scan_job(&run.job_id).unwrap().unwrap();
@@ -1992,7 +2130,8 @@ mod tests {
 
             // Invariant: every cycle completes
             assert_eq!(
-                completed_job.status, ScanJobStatus::Complete,
+                completed_job.status,
+                ScanJobStatus::Complete,
                 "cycle {cycle} must complete"
             );
         }
@@ -2006,15 +2145,30 @@ mod tests {
 
         // 2. Findings monotonically non-decreasing
         for i in 1..cycle_reports.len() {
-            let prev = cycle_reports[i - 1]["cumulative_findings"].as_u64().unwrap();
+            let prev = cycle_reports[i - 1]["cumulative_findings"]
+                .as_u64()
+                .unwrap();
             let curr = cycle_reports[i]["cumulative_findings"].as_u64().unwrap();
-            assert!(curr >= prev, "findings must not decrease: cycle {} ({}) vs {} ({})", i - 1, prev, i, curr);
+            assert!(
+                curr >= prev,
+                "findings must not decrease: cycle {} ({}) vs {} ({})",
+                i - 1,
+                prev,
+                i,
+                curr
+            );
         }
 
         // 3. No stuck or failed jobs
         let all_jobs = pool.list_scan_jobs(&profile.id, 100).unwrap();
-        let failed = all_jobs.iter().filter(|j| j.status == ScanJobStatus::Failed).count();
-        let stuck = all_jobs.iter().filter(|j| j.status == ScanJobStatus::Running).count();
+        let failed = all_jobs
+            .iter()
+            .filter(|j| j.status == ScanJobStatus::Failed)
+            .count();
+        let stuck = all_jobs
+            .iter()
+            .filter(|j| j.status == ScanJobStatus::Running)
+            .count();
         assert_eq!(failed, 0, "no failed jobs after extended soak");
         assert_eq!(stuck, 0, "no stuck jobs after extended soak");
 
@@ -2064,8 +2218,13 @@ mod tests {
         // Verify the report is parseable
         let readback: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
-        assert_eq!(readback["soak_cycles"].as_u64().unwrap(), SOAK_CYCLES as u64);
-        assert!(readback["invariants_passed"]["all_cycles_completed"].as_bool().unwrap());
+        assert_eq!(
+            readback["soak_cycles"].as_u64().unwrap(),
+            SOAK_CYCLES as u64
+        );
+        assert!(readback["invariants_passed"]["all_cycles_completed"]
+            .as_bool()
+            .unwrap());
 
         eprintln!(
             "ARTIFACT: extended_soak_report — {SOAK_CYCLES} cycles in {total_elapsed_ms}ms, \
@@ -2085,7 +2244,9 @@ mod tests {
     /// monitor can consume. The artifact explicitly separates what is
     /// proven from what irreducibly requires calendar time.
     #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::await_holding_lock)] // HOME_ENV_LOCK must serialize HOME through RadarStore awaits.
     async fn readiness_gate_artifact() {
+        let _home_guard = HOME_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let tmp_home = tempfile::TempDir::new().unwrap();
         let lance_dir = tmp_home.path().join("lance");
 
@@ -2103,11 +2264,13 @@ mod tests {
         let token = claimed.unwrap().lease_token.unwrap();
         let fence_ok = !pool.heartbeat_job(&job.id, "wrong").unwrap()
             && pool.heartbeat_job(&job.id, &token).unwrap();
-        pool.complete_job_fenced(&job.id, &token, ScanJobStatus::Complete).unwrap();
+        pool.complete_job_fenced(&job.id, &token, ScanJobStatus::Complete)
+            .unwrap();
 
         // ── 3. Circuit breaker ──
         for _ in 0..3 {
-            pool.upsert_source_health("gate-src", false, Some("500")).unwrap();
+            pool.upsert_source_health("gate-src", false, Some("500"))
+                .unwrap();
         }
         let breaker_trips = pool.is_source_circuit_broken("gate-src");
         pool.upsert_source_health("gate-src", true, None).unwrap();
@@ -2128,17 +2291,31 @@ mod tests {
         let entry = Entry::new(src.id.clone(), "gate test".into());
         pool.insert_entry(&entry).unwrap();
         pool.insert_alias(&ItemAlias::new(
-            entry.id.clone(), "doi".into(), "10.gate/001".into(), "arxiv".into(),
-        )).unwrap();
+            entry.id.clone(),
+            "doi".into(),
+            "10.gate/001".into(),
+            "arxiv".into(),
+        ))
+        .unwrap();
         let dedup_ok = pool.find_by_alias("doi", "10.gate/001").unwrap().is_some();
 
         // ── 6. Notification idempotency ──
-        pool.record_notification(&profile.id, "gate-item", "discord").unwrap();
-        pool.record_notification(&profile.id, "gate-item", "discord").unwrap();
-        let notif_ok = pool.get_notified_items(&profile.id, "discord").unwrap().len() == 1;
+        pool.record_notification(&profile.id, "gate-item", "discord")
+            .unwrap();
+        pool.record_notification(&profile.id, "gate-item", "discord")
+            .unwrap();
+        let notif_ok = pool
+            .get_notified_items(&profile.id, "discord")
+            .unwrap()
+            .len()
+            == 1;
 
         // ── 7. Pipeline execution ──
-        let src2 = Source::new("https://gate.test/2".into(), "Gate2".into(), SourceType::Paper);
+        let src2 = Source::new(
+            "https://gate.test/2".into(),
+            "Gate2".into(),
+            SourceType::Paper,
+        );
         pool.insert_source(&src2).unwrap();
         let entry2 = Entry::new(src2.id.clone(), "rust safety performance research".into());
         pool.insert_entry(&entry2).unwrap();
@@ -2169,13 +2346,24 @@ mod tests {
         let handoff_ok = actionable.iter().all(|f| f.is_actionable());
 
         // All checks
-        let all_mechanical = storage_ok && job_lifecycle_ok && fence_ok
-            && breaker_trips && breaker_recovers
-            && rl_blocks && rl_expires
-            && dedup_ok && notif_ok
-            && pipeline_ok && lance_ok && contract_ok && handoff_ok;
+        let all_mechanical = storage_ok
+            && job_lifecycle_ok
+            && fence_ok
+            && breaker_trips
+            && breaker_recovers
+            && rl_blocks
+            && rl_expires
+            && dedup_ok
+            && notif_ok
+            && pipeline_ok
+            && lance_ok
+            && contract_ok
+            && handoff_ok;
 
-        assert!(all_mechanical, "all mechanical checks must pass for readiness gate");
+        assert!(
+            all_mechanical,
+            "all mechanical checks must pass for readiness gate"
+        );
 
         let gate = serde_json::json!({
             "gate_version": "1.0",
@@ -2226,7 +2414,10 @@ mod tests {
         let readback: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&gate_path).unwrap()).unwrap();
         assert!(readback["all_mechanical_passed"].as_bool().unwrap());
-        assert_eq!(readback["irreducibly_time_based"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            readback["irreducibly_time_based"].as_array().unwrap().len(),
+            2
+        );
 
         eprintln!(
             "ARTIFACT: readiness_gate — all_mechanical={}, time_gaps=2, verdict='{}'\n\
@@ -2238,7 +2429,130 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn triumvirate_intake_loop_publish_poll_outcome_and_dedupe() {
+        let pool = DbPool::test_pool().unwrap();
+        let mut finding = Finding::new(
+            "https://arxiv.org/abs/2099.00001".into(),
+            "Deterministic Intake Paper".into(),
+            SourceType::Paper,
+            "alignment".into(),
+            "Adopt intake loop".into(),
+            "Summary of intake finding.".into(),
+            "Wire the intake loop".into(),
+            vec!["intake".into()],
+        );
+        finding.id = "finding-intake-0001".into();
+        finding.confidence = 0.9;
+        finding.novelty_score = 0.4;
+
+        let (publish_server, publish_url) =
+            mock_minerva(vec![(200, r#"{"obligation_ids":["obl-A"]}"#.into())]).await;
+        let publisher =
+            TriumviratePublisher::new(publish_url, "proj-intake".into(), Some("tok".into()));
+        let outcome = publisher.publish(&finding, None).await.unwrap();
+        publish_server.await.unwrap();
+
+        assert_eq!(outcome.status, 200);
+        assert_eq!(outcome.obligation_ids, vec!["obl-A".to_string()]);
+
+        pool.record_published_finding(
+            &finding.id,
+            &outcome.obligation_ids,
+            finding.source_type.as_str(),
+            &finding.domain,
+            finding.confidence as f64,
+            finding.novelty_score as f64,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(pool.outcome_rows().unwrap().len(), 1);
+        let row = pool
+            .outcome_rows()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.finding_id == "finding-intake-0001")
+            .unwrap();
+        assert_eq!(row.obligation_ids, vec!["obl-A".to_string()]);
+        assert_eq!(row.outcome, "pending");
+
+        let (poll_server, poll_url) =
+            mock_minerva(vec![(200, r#"{"status":"applied"}"#.into())]).await;
+        let poll_publisher =
+            TriumviratePublisher::new(poll_url, "proj-intake".into(), Some("tok".into()));
+        let poller = FeedbackPoller::new(poll_publisher, pool);
+        let summary = poller.poll_once().await.unwrap();
+        poll_server.await.unwrap();
+
+        assert_eq!(summary.accepted, 1);
+        let rows = poller.pool().outcome_rows().unwrap();
+        let accepted_row = rows
+            .iter()
+            .find(|r| r.finding_id == "finding-intake-0001")
+            .unwrap();
+        assert_eq!(accepted_row.outcome, "accepted");
+
+        let weights = source_usefulness(&rows);
+        let paper = weights.iter().find(|w| w.key == "paper").unwrap();
+        assert_eq!(paper.accepted, 1);
+        assert!(paper.usefulness > 0.5);
+
+        let pool2 = poller.pool();
+        let before = pool2.outcome_rows().unwrap().len();
+        pool2
+            .record_published_finding(
+                "finding-intake-0001",
+                &["obl-A".into()],
+                "paper",
+                "alignment",
+                0.9,
+                0.4,
+                None,
+            )
+            .unwrap();
+        let after_rows = pool2.outcome_rows().unwrap();
+        assert_eq!(
+            after_rows.len(),
+            before,
+            "re-publishing the same finding must not create a duplicate row"
+        );
+        let still = after_rows
+            .iter()
+            .find(|r| r.finding_id == "finding-intake-0001")
+            .unwrap();
+        assert_eq!(
+            still.outcome, "accepted",
+            "dedupe must not double-count or reset the accepted outcome"
+        );
+    }
+
     // ─── Helpers ──────────────────────────────────────────────────────────
+
+    async fn mock_minerva(responses: Vec<(u16, String)>) -> (tokio::task::JoinHandle<()>, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+
+        let handle = tokio::spawn(async move {
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                let mut buf = vec![0u8; 8192];
+                let _ = stream.read(&mut buf).await.unwrap();
+
+                let response = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+
+        (handle, base_url)
+    }
 
     fn make_finding(title: &str, urgency: UrgencyLevel, confidence: f32, impact: f32) -> Finding {
         let mut f = Finding::new(

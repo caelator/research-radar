@@ -24,7 +24,7 @@ use uuid::Uuid;
 /// How urgently this finding should be acted on.
 ///
 /// Used by evolve to prioritize its PR queue and by humans reviewing the queue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UrgencyLevel {
     /// Nice-to-have. Architectural pattern, quality-of-life improvement.
@@ -47,6 +47,8 @@ impl UrgencyLevel {
         }
     }
 
+    // Intentional inherent parser: infallible and returns Self, distinct from std::str::FromStr.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "low" => Self::Low,
@@ -193,6 +195,11 @@ pub struct Finding {
     /// calibrate review time.
     pub impact_weight: f32,
 
+    /// 0.0 = identical to a prior finding; 1.0 = maximally novel (no similar prior).
+    /// Computed as 1.0 - max cosine similarity vs prior finding embeddings.
+    #[serde(default)]
+    pub novelty_score: f32,
+
     /// Urgency classification. Determines queue priority.
     ///
     /// Critical = CVE, active exploit, severe regression → evolve should flag
@@ -213,6 +220,16 @@ pub struct Finding {
     /// evolve is responsible for generating the specific diff from this intent
     /// plus an applicability search against the codebase.
     pub suggested_action: String,
+
+    /// Real LLM-evaluated hypothesis of how this finding applies to the target system.
+    ///
+    /// Empty when evaluation has not been run.
+    #[serde(default)]
+    pub applicability_hypothesis: String,
+
+    /// Optional concrete experiment evolve could run to validate applicability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_experiment: Option<String>,
 
     /// Freeform tags for filtering the evolve queue and scoping applicability.
     ///
@@ -270,14 +287,34 @@ impl Finding {
             summary,
             confidence: 0.5,
             impact_weight: 0.5,
+            novelty_score: 0.0,
             urgency: UrgencyLevel::Medium,
             suggested_action,
+            applicability_hypothesis: String::new(),
+            suggested_experiment: None,
             applicability_tags,
             cited_paper: None,
             discovered_at: Utc::now(),
             related_entry_ids: Vec::new(),
             schema_version: String::from("1.0"),
         }
+    }
+
+    /// Set the novelty score (0.0..=1.0). Returns self for chaining.
+    pub fn with_novelty_score(mut self, novelty: f32) -> Self {
+        self.novelty_score = novelty;
+        self
+    }
+
+    /// Attach an evaluated applicability hypothesis (and optional suggested experiment).
+    pub fn with_applicability(
+        mut self,
+        hypothesis: String,
+        suggested_experiment: Option<String>,
+    ) -> Self {
+        self.applicability_hypothesis = hypothesis;
+        self.suggested_experiment = suggested_experiment;
+        self
     }
 
     /// Whether this finding is severe enough to warrant immediate action.
@@ -332,10 +369,28 @@ mod tests {
         assert_eq!(f.schema_version, "1.0");
         assert_eq!(f.confidence, 0.5);
         assert_eq!(f.impact_weight, 0.5);
+        assert_eq!(f.novelty_score, 0.0);
         assert_eq!(f.urgency, UrgencyLevel::Medium);
         assert!(!f.is_critical());
         assert!(f.is_actionable());
         assert!(!f.id.is_empty());
+    }
+
+    #[test]
+    fn with_novelty_score_sets_field() {
+        let f = Finding::new(
+            "https://example.com/paper".into(),
+            "Example Paper".into(),
+            super::super::SourceType::Paper,
+            "rust".into(),
+            "Tokio spawn pattern".into(),
+            "A better pattern for spawning tasks.".into(),
+            "Refactor to use JoinSet".into(),
+            vec!["async-runtime".into()],
+        )
+        .with_novelty_score(0.7);
+
+        assert_eq!(f.novelty_score, 0.7);
     }
 
     #[test]
@@ -448,6 +503,10 @@ mod tests {
             "A better pattern for spawning tasks.".into(),
             "Refactor to use JoinSet".into(),
             vec!["async-runtime".into()],
+        )
+        .with_applicability(
+            "applies to async runtime".into(),
+            Some("benchmark JoinSet vs raw spawn".into()),
         );
         f.cited_paper = Some(PaperRef::new(
             "Formal Concurrency".into(),
@@ -468,6 +527,8 @@ mod tests {
             parsed.cited_paper.as_ref().unwrap().title,
             "Formal Concurrency"
         );
+        assert_eq!(parsed.applicability_hypothesis, f.applicability_hypothesis);
+        assert_eq!(parsed.suggested_experiment, f.suggested_experiment);
         assert_eq!(parsed.related_entry_ids.len(), 2);
         assert_eq!(parsed.schema_version, "1.0");
     }

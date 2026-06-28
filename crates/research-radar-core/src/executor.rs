@@ -7,14 +7,30 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::arxiv;
+use crate::github;
 use crate::notify;
 use crate::openalex;
+use crate::rustsec;
 use crate::scorer::{LlmBackend, MockBackend, ScorerResult};
 use crate::semantic_scholar;
 use crate::{
     score_entry, DbPool, Entry, Finding, Profile, RadarStore, ScanJobStatus, ScoredMatch,
     StorageError, UrgencyLevel,
 };
+
+const DEFAULT_LLM_CALL_MICROUNITS: i64 = 1000;
+
+pub fn llm_budget_microunits() -> Option<i64> {
+    let value = std::env::var("RADAR_LLM_BUDGET_MICROUNITS").ok()?;
+    if value.is_empty() {
+        return None;
+    }
+    value.parse::<i64>().ok()
+}
+
+fn budget_allows(spent: i64, budget: Option<i64>, call_cost: i64) -> bool {
+    budget.is_none_or(|budget| spent + call_cost <= budget)
+}
 
 fn tokio_block_on<F: std::future::Future>(fut: F) -> F::Output {
     match tokio::runtime::Handle::try_current() {
@@ -39,13 +55,17 @@ pub struct PipelineRun {
     pub arxiv_fetched: usize,
     pub s2_fetched: usize,
     pub oa_fetched: usize,
+    pub rustsec_fetched: usize,
+    pub github_fetched: usize,
+    pub llm_budget_remaining: Option<i64>,
 }
 
 pub struct PipelineExecutor {
     scorer: Arc<dyn LlmBackend>,
     discord_webhook_url: Option<String>,
-    /// If true, skips external API calls (arXiv, Semantic Scholar, OpenAlex).
-    /// Set by `test_executor()` and by callers that want an offline run.
+    /// If true, skips external API calls (arXiv, Semantic Scholar, OpenAlex,
+    /// RustSec, GitHub) in tests and offline runs.
+    #[allow(dead_code)] // Read only in test-executor code paths.
     disable_external_fetches: bool,
     /// Optional explicit LanceDB directory. When set, `persist_findings`
     /// writes here instead of resolving `~/.research-radar/lance` from the
@@ -191,7 +211,10 @@ impl PipelineExecutor {
 
         // Stage 1a: Fetch from arXiv (if keywords present, source not circuit-broken)
         let arxiv_fetched = if pool.is_source_circuit_broken("arxiv") {
-            tracing::info!("arXiv circuit breaker open — skipping fetch for '{}'", profile.name);
+            tracing::info!(
+                "arXiv circuit breaker open — skipping fetch for '{}'",
+                profile.name
+            );
             0
         } else {
             self.fetch_arxiv(pool, &profile)
@@ -200,7 +223,10 @@ impl PipelineExecutor {
 
         // Stage 1b: Fetch from Semantic Scholar (if not circuit-broken)
         let s2_fetched = if pool.is_source_circuit_broken("semantic_scholar") {
-            tracing::info!("Semantic Scholar circuit breaker open — skipping fetch for '{}'", profile.name);
+            tracing::info!(
+                "Semantic Scholar circuit breaker open — skipping fetch for '{}'",
+                profile.name
+            );
             0
         } else {
             self.fetch_s2(pool, &profile)
@@ -209,10 +235,37 @@ impl PipelineExecutor {
 
         // Stage 1c: Fetch from OpenAlex (if not circuit-broken)
         let oa_fetched = if pool.is_source_circuit_broken("openalex") {
-            tracing::info!("OpenAlex circuit breaker open — skipping fetch for '{}'", profile.name);
+            tracing::info!(
+                "OpenAlex circuit breaker open — skipping fetch for '{}'",
+                profile.name
+            );
             0
         } else {
             self.fetch_openalex(pool, &profile)
+        };
+        self.heartbeat(pool, job);
+
+        // Stage 1d: Fetch from RustSec (if not circuit-broken)
+        let rustsec_fetched = if pool.is_source_circuit_broken("rustsec") {
+            tracing::info!(
+                "RustSec circuit breaker open — skipping fetch for '{}'",
+                profile.name
+            );
+            0
+        } else {
+            self.fetch_rustsec(pool, &profile)
+        };
+        self.heartbeat(pool, job);
+
+        // Stage 1e: Fetch from GitHub (if not circuit-broken)
+        let github_fetched = if pool.is_source_circuit_broken("github") {
+            tracing::info!(
+                "GitHub circuit breaker open — skipping fetch for '{}'",
+                profile.name
+            );
+            0
+        } else {
+            self.fetch_github(pool, &profile)
         };
         self.heartbeat(pool, job);
 
@@ -227,11 +280,28 @@ impl PipelineExecutor {
         let ranked = self.rank_candidates(&profile, candidates);
         self.heartbeat(pool, job);
 
-        // Stage 5: LLM score the top candidates (bounded by max_llm_calls),
-        // then merge the refined scores back into `ranked` so every downstream
-        // stage (persist, findings, notify) uses the best-available score.
-        let llm_results = self.llm_score(&profile, &ranked);
-        let ranked = self.merge_llm_scores(ranked, &llm_results, &profile);
+        // Stage 5: LLM score the top candidates (bounded by max_llm_calls and budget)
+        let budget = llm_budget_microunits();
+        let mut spent = job.llm_spend_microunits;
+        let (scored, budget_warning) = self.llm_score(&profile, &ranked, &mut spent, budget);
+        job.llm_spend_microunits = spent;
+        if let Some(reason) = budget_warning {
+            let mut warnings = job
+                .warnings_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok())
+                .unwrap_or_default();
+            warnings.push(reason.clone());
+            job.warnings_json = serde_json::to_string(&warnings).ok();
+            tracing::warn!("{reason}");
+        }
+        // Merge LLM-refined scores back into ranked candidates so downstream
+        // stages (persist, findings, notify) use the best-available score.
+        let llm_map: std::collections::HashMap<String, &ScorerResult> = scored
+            .iter()
+            .map(|(id, r)| (id.clone(), r))
+            .collect();
+        let ranked = self.merge_llm_scores(ranked, &llm_map, &profile);
         self.heartbeat(pool, job);
 
         // Stage 6: Persist scores
@@ -272,6 +342,9 @@ impl PipelineExecutor {
             arxiv_fetched,
             s2_fetched,
             oa_fetched,
+            rustsec_fetched,
+            github_fetched,
+            llm_budget_remaining: budget.map(|b| b - job.llm_spend_microunits),
         })
     }
 
@@ -376,9 +449,7 @@ impl PipelineExecutor {
             });
             wm.last_fetched_at = Some(Utc::now());
             // Only advance the watermark forward
-            let should_advance = wm
-                .last_item_published_at
-                .map_or(true, |prev| newest > prev);
+            let should_advance = wm.last_item_published_at.is_none_or(|prev| newest > prev);
             if should_advance {
                 wm.last_item_published_at = Some(newest);
             }
@@ -534,9 +605,7 @@ impl PipelineExecutor {
                 )
             });
             wm.last_fetched_at = Some(Utc::now());
-            let should_advance = wm
-                .last_item_published_at
-                .map_or(true, |prev| newest > prev);
+            let should_advance = wm.last_item_published_at.is_none_or(|prev| newest > prev);
             if should_advance {
                 wm.last_item_published_at = Some(newest);
             }
@@ -697,9 +766,7 @@ impl PipelineExecutor {
                 SourceWatermark::new(profile.id.clone(), "openalex".into(), scope_hash.clone())
             });
             wm.last_fetched_at = Some(Utc::now());
-            let should_advance = wm
-                .last_item_published_at
-                .map_or(true, |prev| newest > prev);
+            let should_advance = wm.last_item_published_at.is_none_or(|prev| newest > prev);
             if should_advance {
                 wm.last_item_published_at = Some(newest);
             }
@@ -726,6 +793,263 @@ impl PipelineExecutor {
     /// doesn't make each scan O(corpus). Newly-fetched entries are prioritized
     /// (they have the highest rowid).
     const MAX_CANDIDATES_PER_SCAN: usize = 500;
+    /// Fetch advisories from RustSec and insert as sources + entries.
+    ///
+    /// Uses alias-based dedup (rustsec_id and cross-ref cve) and watermark
+    /// tracking for incremental fetching.
+    fn fetch_rustsec(&self, pool: &DbPool, profile: &Profile) -> usize {
+        use crate::{ItemAlias, SourceWatermark};
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        #[cfg(test)]
+        if self.disable_external_fetches {
+            return 0;
+        }
+
+        let scope_hash = {
+            let mut sorted = profile.keywords.clone();
+            sorted.sort();
+            let mut h = DefaultHasher::new();
+            sorted.hash(&mut h);
+            format!("rustsec_{:016x}", h.finish())
+        };
+
+        let watermark = pool
+            .get_watermark(&profile.id, "rustsec", &scope_hash)
+            .ok()
+            .flatten();
+
+        let advisories = match tokio_block_on(rustsec::fetch_rustsec_advisories(profile, 20)) {
+            Ok(advisories) => {
+                let _ = pool.upsert_source_health("rustsec", true, None);
+                advisories
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                tracing::warn!("RustSec fetch failed: {err_str}");
+                let _ = pool.upsert_source_health("rustsec", false, Some(&err_str));
+                if err_str.contains("429") || err_str.to_lowercase().contains("rate limit") {
+                    let backoff = chrono::Utc::now() + chrono::Duration::minutes(10);
+                    let _ = pool.set_rate_limit_until("rustsec", backoff);
+                    tracing::warn!("RustSec rate-limited — backoff until {backoff}");
+                }
+                return 0;
+            }
+        };
+
+        let mut inserted = 0;
+        let mut newest_published: Option<chrono::DateTime<chrono::Utc>> = None;
+
+        for adv in &advisories {
+            // Skip advisories older than watermark
+            if let Some(ref wm) = watermark {
+                if let (Some(last_pub), Some(pub_date)) = (wm.last_item_published_at, adv.published)
+                {
+                    if pub_date <= last_pub {
+                        continue;
+                    }
+                }
+            }
+
+            // Alias-based dedup: check RustSec advisory ID
+            if let Ok(Some(_)) = pool.find_by_alias("rustsec_id", &adv.advisory_id) {
+                continue;
+            }
+
+            // Cross-source dedup: check CVE aliases
+            if adv.aliases.iter().any(|alias| {
+                alias.starts_with("CVE-") && matches!(pool.find_by_alias("cve", alias), Ok(Some(_)))
+            }) {
+                continue;
+            }
+
+            let (source, entry) = rustsec::advisory_to_source_entry(adv);
+            if pool.insert_source(&source).is_ok() && pool.insert_entry(&entry).is_ok() {
+                // Register RustSec advisory ID alias
+                let alias = ItemAlias::new(
+                    entry.id.clone(),
+                    "rustsec_id".into(),
+                    adv.advisory_id.clone(),
+                    "rustsec".into(),
+                );
+                let _ = pool.insert_alias(&alias);
+
+                // Register CVE aliases for cross-source dedup
+                for cve in adv.aliases.iter().filter(|alias| alias.starts_with("CVE-")) {
+                    let cve_alias = ItemAlias::new(
+                        entry.id.clone(),
+                        "cve".into(),
+                        cve.clone(),
+                        "rustsec".into(),
+                    );
+                    let _ = pool.insert_alias(&cve_alias);
+                }
+
+                inserted += 1;
+
+                if let Some(pub_date) = adv.published {
+                    match newest_published {
+                        Some(cur) if pub_date > cur => {
+                            newest_published = Some(pub_date);
+                        }
+                        None => {
+                            newest_published = Some(pub_date);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Update watermark
+        if let Some(newest) = newest_published {
+            let mut wm = watermark.unwrap_or_else(|| {
+                SourceWatermark::new(profile.id.clone(), "rustsec".into(), scope_hash.clone())
+            });
+            wm.last_fetched_at = Some(Utc::now());
+            let should_advance = wm.last_item_published_at.is_none_or(|prev| newest > prev);
+            if should_advance {
+                wm.last_item_published_at = Some(newest);
+            }
+            let _ = pool.upsert_watermark(&wm);
+        } else if watermark.is_none() && !advisories.is_empty() {
+            let mut wm =
+                SourceWatermark::new(profile.id.clone(), "rustsec".into(), scope_hash.clone());
+            wm.last_fetched_at = Some(Utc::now());
+            let _ = pool.upsert_watermark(&wm);
+        }
+
+        if inserted > 0 {
+            tracing::info!(
+                "RustSec: fetched {inserted} new advisories for profile '{}'",
+                profile.name
+            );
+        }
+        inserted
+    }
+
+    /// Fetch releases from GitHub and insert as sources + entries.
+    ///
+    /// Uses alias-based dedup (github_release) and watermark tracking for
+    /// incremental fetching.
+    fn fetch_github(&self, pool: &DbPool, profile: &Profile) -> usize {
+        use crate::{ItemAlias, SourceWatermark};
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        if profile.keywords.is_empty() {
+            return 0;
+        }
+
+        #[cfg(test)]
+        if self.disable_external_fetches {
+            return 0;
+        }
+
+        let scope_hash = {
+            let mut sorted = profile.keywords.clone();
+            sorted.sort();
+            let mut h = DefaultHasher::new();
+            sorted.hash(&mut h);
+            format!("github_{:016x}", h.finish())
+        };
+
+        let watermark = pool
+            .get_watermark(&profile.id, "github", &scope_hash)
+            .ok()
+            .flatten();
+
+        let releases = match tokio_block_on(github::fetch_github_releases(profile, 20)) {
+            Ok(releases) => {
+                let _ = pool.upsert_source_health("github", true, None);
+                releases
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                tracing::warn!("GitHub fetch failed: {err_str}");
+                let _ = pool.upsert_source_health("github", false, Some(&err_str));
+                if err_str.contains("429") || err_str.to_lowercase().contains("rate limit") {
+                    let backoff = chrono::Utc::now() + chrono::Duration::minutes(10);
+                    let _ = pool.set_rate_limit_until("github", backoff);
+                    tracing::warn!("GitHub rate-limited — backoff until {backoff}");
+                }
+                return 0;
+            }
+        };
+
+        let mut inserted = 0;
+        let mut newest_published: Option<chrono::DateTime<chrono::Utc>> = None;
+
+        for rel in &releases {
+            // Skip releases older than watermark
+            if let Some(ref wm) = watermark {
+                if let (Some(last_pub), Some(pub_date)) =
+                    (wm.last_item_published_at, rel.published_at)
+                {
+                    if pub_date <= last_pub {
+                        continue;
+                    }
+                }
+            }
+
+            let release_key = format!("{}@{}", rel.repo_full_name, rel.tag_name);
+            if let Ok(Some(_)) = pool.find_by_alias("github_release", &release_key) {
+                continue;
+            }
+
+            let (source, entry) = github::release_to_source_entry(rel);
+            if pool.insert_source(&source).is_ok() && pool.insert_entry(&entry).is_ok() {
+                let alias = ItemAlias::new(
+                    entry.id.clone(),
+                    "github_release".into(),
+                    release_key,
+                    "github".into(),
+                );
+                let _ = pool.insert_alias(&alias);
+
+                inserted += 1;
+
+                if let Some(pub_date) = rel.published_at {
+                    match newest_published {
+                        Some(cur) if pub_date > cur => {
+                            newest_published = Some(pub_date);
+                        }
+                        None => {
+                            newest_published = Some(pub_date);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Update watermark
+        if let Some(newest) = newest_published {
+            let mut wm = watermark.unwrap_or_else(|| {
+                SourceWatermark::new(profile.id.clone(), "github".into(), scope_hash.clone())
+            });
+            wm.last_fetched_at = Some(Utc::now());
+            let should_advance = wm.last_item_published_at.is_none_or(|prev| newest > prev);
+            if should_advance {
+                wm.last_item_published_at = Some(newest);
+            }
+            let _ = pool.upsert_watermark(&wm);
+        } else if watermark.is_none() && !releases.is_empty() {
+            let mut wm =
+                SourceWatermark::new(profile.id.clone(), "github".into(), scope_hash.clone());
+            wm.last_fetched_at = Some(Utc::now());
+            let _ = pool.upsert_watermark(&wm);
+        }
+
+        if inserted > 0 {
+            tracing::info!(
+                "GitHub: fetched {inserted} new releases for profile '{}'",
+                profile.name
+            );
+        }
+        inserted
+    }
 
     fn fetch_candidates(
         &self,
@@ -742,7 +1066,7 @@ impl PipelineExecutor {
             pool.list_sources_by_ids(&profile.sources)?
         };
         for source in &sources {
-            let source_entries = pool.list_entries(Some(&[source.id.clone()]))?;
+            let source_entries = pool.list_entries(Some(std::slice::from_ref(&source.id)))?;
             if source_entries.is_empty() {
                 let content = format!("{} {}", source.title, source.url);
                 let mut entry = Entry::new(source.id.clone(), content);
@@ -788,15 +1112,16 @@ impl PipelineExecutor {
 
     /// Run LLM scoring on the top keyword-matched candidates.
     ///
-    /// Returns a map keyed by entry_id so that `persist_scores` can look up the
-    /// refined LLM score for each candidate. Only the top candidates above the
+    /// Returns results with cost tracking. Only the top candidates above the
     /// keyword-score threshold are sent to the (expensive) LLM, bounded by
-    /// `max_llm_calls`.
+    /// `max_llm_calls` and the configured budget.
     fn llm_score(
         &self,
         profile: &Profile,
         ranked: &[ScoredMatch],
-    ) -> std::collections::HashMap<String, ScorerResult> {
+        spent: &mut i64,
+        budget: Option<i64>,
+    ) -> (Vec<(String, ScorerResult)>, Option<String>) {
         let above_threshold: Vec<&ScoredMatch> = ranked
             .iter()
             .filter(|m| m.score >= profile.score_threshold)
@@ -804,31 +1129,47 @@ impl PipelineExecutor {
             .collect();
 
         if above_threshold.is_empty() {
-            return std::collections::HashMap::new();
+            return (Vec::new(), None);
         }
 
-        let mut results = std::collections::HashMap::with_capacity(above_threshold.len());
+        let mut results: Vec<(String, ScorerResult)> = Vec::new();
+        let mut budget_exhausted = None;
         for scored in above_threshold {
+            if !budget_allows(*spent, budget, DEFAULT_LLM_CALL_MICROUNITS) {
+                let budget_value = budget.unwrap();
+                budget_exhausted = Some(format!(
+                    "LLM budget exhausted: spent {} of {budget_value} microunits",
+                    *spent
+                ));
+                break;
+            }
             match tokio_block_on(self.scorer.score(&scored.entry, profile)) {
                 Ok(result) => {
-                    results.insert(scored.entry.id.clone(), result);
+                    let real = if result.cost_microunits > 0 {
+                        result.cost_microunits
+                    } else {
+                        DEFAULT_LLM_CALL_MICROUNITS
+                    };
+                    *spent += real;
+                    results.push((scored.entry.id.clone(), result));
                 }
                 Err(e) => {
                     tracing::warn!("LLM scoring failed for entry {}: {e}", scored.entry.id);
-                    // Fall back to the keyword score so the entry is still scored.
-                    results.insert(
+                    results.push((
                         scored.entry.id.clone(),
                         ScorerResult {
                             score: scored.score,
                             reason: format!("LLM scoring failed: {e}"),
                             rationale: String::new(),
                             disposition: "llm_failed".to_string(),
+                            cost_microunits: 0,
                         },
-                    );
+                    ));
+                    *spent += DEFAULT_LLM_CALL_MICROUNITS;
                 }
             }
         }
-        results
+        (results, budget_exhausted)
     }
 
     fn persist_scores(
@@ -868,7 +1209,7 @@ impl PipelineExecutor {
     fn merge_llm_scores(
         &self,
         mut ranked: Vec<ScoredMatch>,
-        llm_results: &std::collections::HashMap<String, ScorerResult>,
+        llm_results: &std::collections::HashMap<String, &ScorerResult>,
         profile: &Profile,
     ) -> Vec<ScoredMatch> {
         for sm in ranked.iter_mut() {
@@ -907,6 +1248,11 @@ impl PipelineExecutor {
             }
         })
         .map_err(|err| StorageError::Io(std::io::Error::other(err.to_string())))?;
+        let embed_backend = crate::embedding::active_embedding_backend();
+        let priors: Vec<Vec<f32>> = match &embed_backend {
+            Some(_) => tokio_block_on(store.fetch_finding_embeddings(1000)).unwrap_or_default(),
+            None => Vec::new(),
+        };
 
         for scored in accepted {
             let source = pool.get_source(&scored.entry.source_id)?.ok_or_else(|| {
@@ -937,8 +1283,33 @@ impl PipelineExecutor {
                 "Incorporate or review source '{}' against profile '{}' keywords",
                 source.title, profile.name
             );
-            tokio_block_on(store.insert_finding(&finding))
-                .map_err(|err| StorageError::Io(std::io::Error::other(err.to_string())))?;
+            match &embed_backend {
+                Some(backend) => {
+                    let text = format!("{}\n{}", finding.title, finding.summary);
+                    match tokio_block_on(backend.embed(&text)) {
+                        Ok(vec) => {
+                            let novelty = crate::embedding::compute_novelty(&vec, &priors);
+                            finding.novelty_score = novelty;
+                            tokio_block_on(
+                                store.insert_finding_with_embedding(&finding, Some(&vec)),
+                            )
+                            .map_err(|err| {
+                                StorageError::Io(std::io::Error::other(err.to_string()))
+                            })?;
+                        }
+                        Err(e) => {
+                            tracing::warn!("embedding failed for finding {}: {e}", finding.id);
+                            tokio_block_on(store.insert_finding(&finding)).map_err(|err| {
+                                StorageError::Io(std::io::Error::other(err.to_string()))
+                            })?;
+                        }
+                    }
+                }
+                None => {
+                    tokio_block_on(store.insert_finding(&finding))
+                        .map_err(|err| StorageError::Io(std::io::Error::other(err.to_string())))?;
+                }
+            }
         }
 
         Ok(())
@@ -1010,10 +1381,82 @@ fn normalize_text(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scorer::ScorerError;
     use crate::{DbPool, Profile, Source, SourceType};
+    use async_trait::async_trait;
+
+    #[test]
+    fn budget_allows_under_budget_permits() {
+        assert!(budget_allows(0, Some(2000), 1000));
+        assert!(budget_allows(1000, Some(2000), 1000));
+    }
+
+    #[test]
+    fn budget_allows_over_budget_skips() {
+        assert!(!budget_allows(2000, Some(2000), 1000));
+        assert!(!budget_allows(1500, Some(2000), 1000));
+    }
+
+    #[test]
+    fn budget_allows_none_is_unlimited() {
+        assert!(budget_allows(999999, None, 1000));
+    }
+
+    struct FixedCostBackend {
+        cost_microunits: i64,
+    }
+
+    #[async_trait]
+    impl LlmBackend for FixedCostBackend {
+        async fn score(
+            &self,
+            _entry: &Entry,
+            _profile: &Profile,
+        ) -> Result<ScorerResult, ScorerError> {
+            Ok(ScorerResult {
+                score: 0.9,
+                reason: "fixed".into(),
+                rationale: "fixed cost backend".into(),
+                disposition: "matched".into(),
+                cost_microunits: self.cost_microunits,
+            })
+        }
+    }
+
+    #[test]
+    fn llm_score_accrues_real_cost_and_gates_on_real_spend() {
+        let mut profile = Profile::new("AI".into(), vec!["AI".into()]);
+        profile.max_llm_calls = 3;
+        profile.score_threshold = 0.5;
+
+        let ranked: Vec<ScoredMatch> = (0..3)
+            .map(|idx| ScoredMatch {
+                entry: Entry::new("src".into(), format!("AI safety entry {idx}")),
+                profile_id: profile.id.clone(),
+                score: 0.9,
+                disposition: "new".into(),
+            })
+            .collect();
+
+        let executor = PipelineExecutor::with_scorer(Arc::new(FixedCostBackend {
+            cost_microunits: 4000,
+        }));
+        let mut spent = 0;
+        let (results, warning) = executor.llm_score(&profile, &ranked, &mut spent, Some(8500));
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(spent, 8000);
+        assert_eq!(
+            warning.as_deref(),
+            Some("LLM budget exhausted: spent 8000 of 8500 microunits")
+        );
+    }
 
     #[test]
     fn executor_claims_and_completes_job() {
+        let _home_guard = crate::storage::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let pool = DbPool::test_pool().unwrap();
         let profile = Profile::new("AI".into(), vec!["AI".into(), "safety".into()]);
         pool.insert_profile(&profile).unwrap();
@@ -1028,7 +1471,10 @@ mod tests {
         pool.insert_entry(&entry).unwrap();
 
         let job = pool.enqueue_job(&profile.id, Some("test".into())).unwrap();
-        let run = PipelineExecutor::test_executor().run_next(&pool).unwrap().unwrap();
+        let run = PipelineExecutor::test_executor()
+            .run_next(&pool)
+            .unwrap()
+            .unwrap();
         assert_eq!(run.job_id, job.id);
         // The manually-added entry should be accepted
         assert!(run.accepted >= 1);
@@ -1041,6 +1487,9 @@ mod tests {
 
     #[test]
     fn executor_creates_entries_from_sources_when_needed() {
+        let _home_guard = crate::storage::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let pool = DbPool::test_pool().unwrap();
         let profile = Profile::new("Rust".into(), vec!["rust".into()]);
         pool.insert_profile(&profile).unwrap();
@@ -1067,6 +1516,9 @@ mod tests {
 
     #[test]
     fn executor_with_mock_scorer() {
+        let _home_guard = crate::storage::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let pool = DbPool::test_pool().unwrap();
         let profile = Profile::new("AI".into(), vec!["AI".into(), "safety".into()]);
         pool.insert_profile(&profile).unwrap();
@@ -1119,7 +1571,9 @@ mod tests {
         let entry = Entry::new(source.id.clone(), "AI alignment research".into());
         pool.insert_entry(&entry).unwrap();
 
-        let executor = PipelineExecutor::test_executor();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let executor = PipelineExecutor::test_executor()
+            .with_lance_store_path(tmp.path().join("lance"));
 
         // First scan: should find and score the entry.
         let _job1 = pool.enqueue_job(&profile.id, None).unwrap();
@@ -1201,6 +1655,7 @@ mod tests {
                     reason: "LLM override".into(),
                     rationale: "mock".into(),
                     disposition: "matched".into(),
+                    cost_microunits: 0,
                 })
             }
         }

@@ -34,6 +34,8 @@ impl SourceType {
         }
     }
 
+    // Intentional inherent parser: infallible and returns Self, distinct from std::str::FromStr.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "paper" => Self::Paper,
@@ -207,6 +209,8 @@ impl ScanJobStatus {
         }
     }
 
+    // Intentional inherent parser: infallible and returns Self, distinct from std::str::FromStr.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "pending" => Self::Pending,
@@ -387,19 +391,27 @@ pub fn http_client() -> reqwest::Result<reqwest::Client> {
 
 pub mod arxiv;
 pub mod embedding;
+pub mod evaluate;
 pub mod executor;
+pub mod feedback;
 pub mod finding;
+pub mod github;
 pub mod notify;
 pub mod openalex;
+pub mod pricing;
 #[cfg(test)]
 mod prove_it;
+pub mod publish;
+pub mod rustsec;
 pub mod score;
 pub mod scorer;
 pub mod semantic_scholar;
 pub mod storage;
+pub mod triumvirate;
 
-pub use executor::{PipelineExecutor, PipelineRun};
+pub use executor::{llm_budget_microunits, PipelineExecutor, PipelineRun};
 pub use finding::{Finding, PaperRef, UrgencyLevel};
+pub use publish::{AutoPublisher, PublishConfig, PublishCycleSummary};
 pub use score::score_entry;
 pub use scorer::{AnthropicBackend, LlmBackend, MockBackend, ScorerResult};
 pub use storage::lance_store::Result as LanceResult;
